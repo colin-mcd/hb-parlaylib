@@ -34,6 +34,16 @@
 #endif
 
 
+namespace spork {
+  void init_heartbeat_stats();
+  void start_heartbeats() noexcept;
+  void pause_heartbeats() noexcept;
+  template <typename LambdaL, typename LambdaR>
+  void par(const LambdaL&& lamL, const LambdaR&& lamR);
+  template <typename idx, typename BodyLambda>
+  void parfor(idx i, idx j, const BodyLambda&& body);
+}
+
 // PARLAY_ELASTIC_STEAL_TIMEOUT sets the number of microseconds
 // that a worker will attempt to steal jobs, such that if no
 // jobs are successfully stolen, it will go to sleep.
@@ -124,6 +134,7 @@ struct scheduler {
   }
 
   ~scheduler() {
+    spork::pause_heartbeats();
     shutdown();
     worker_info = std::move(parent_worker_info);
   }
@@ -326,6 +337,19 @@ struct scheduler {
   }
 };
 
+}  // namespace parlay
+
+namespace spork {
+  void init_heartbeat_stats();
+  void start_heartbeats() noexcept;
+  void pause_heartbeats() noexcept;
+  template <typename LambdaL, typename LambdaR>
+  void par(const LambdaL&& lamL, const LambdaR&& lamR);
+  template <typename idx, typename BodyLambda>
+  void parfor(idx i, idx j, const BodyLambda&& body);
+}
+
+namespace parlay {
 
 class fork_join_scheduler {
   using Job = WorkStealingJob;
@@ -333,69 +357,29 @@ class fork_join_scheduler {
 
  public:
 
-  // Fork two thunks and wait until they both finish.
+  // Fork two thunks and wait until they both finish using Spork's par
   template <typename L, typename R>
-  static void pardo(scheduler_t& scheduler, L&& left, R&& right, bool conservative = false) {
-    auto execute_right = [&]() { std::forward<R>(right)(); };
-    auto right_job = make_job(right);
-    scheduler.spawn(&right_job);
-    std::forward<L>(left)();
-    if (const Job* job = scheduler.get_own_job(); job != nullptr) {
-      assert(job == &right_job);
-      execute_right();
-    }
-    else {
-      auto done = [&]() { return right_job.finished(); };
-      scheduler.wait_until(done, conservative);
-      assert(right_job.finished());
-    }
+  static void pardo(scheduler_t&, L&& left, R&& right, bool = false) {
+    spork::par([&]() { std::forward<L>(left)(); },
+               [&]() { std::forward<R>(right)(); });
   }
 
+  // Parallel loop from start to end using Spork's parfor (ignoring granularity)
   template <typename F>
-  static void parfor(scheduler_t& scheduler, size_t start, size_t end, F&& f, size_t granularity = 0, bool conservative = false) {
+  static void parfor(scheduler_t&, size_t start, size_t end, F&& f, size_t = 0, bool = false) {
     if (end <= start) return;
-    if (granularity == 0) {
-      size_t done = get_granularity(start, end, f);
-      granularity = std::max(done, (end - start) / static_cast<size_t>(128 * scheduler.num_threads));
-      start += done;
+    if (start + 1 == end) {
+      f(start);
+      return;
     }
-    parfor_(scheduler, start, end, f, granularity, conservative);
+    spork::parfor(start, end, [&f](size_t i) { f(i); });
   }
 
  private:
   template <typename F>
-  static size_t get_granularity(size_t start, size_t end, F& f) {
-    size_t done = 0;
-    size_t sz = 1;
-    unsigned long long int ticks = 0;
-    do {
-      sz = std::min(sz, end - (start + done));
-      auto tstart = std::chrono::steady_clock::now();
-      for (size_t i = 0; i < sz; i++) f(start + done + i);
-      auto tstop = std::chrono::steady_clock::now();
-      ticks = static_cast<unsigned long long int>(std::chrono::duration_cast<
-                std::chrono::nanoseconds>(tstop - tstart).count());
-      done += sz;
-      sz *= 2;
-    } while (ticks < 1000 && done < (end - start));
-    return done;
+  static void parfor_(scheduler_t& scheduler, size_t start, size_t end, F& f, size_t = 0, bool conservative = false) {
+    parfor(scheduler, start, end, f, 0, conservative);
   }
-
-  template <typename F>
-  static void parfor_(scheduler_t& scheduler, size_t start, size_t end, F& f, size_t granularity, bool conservative) {
-    if ((end - start) <= granularity)
-      for (size_t i = start; i < end; i++) f(i);
-    else {
-      size_t n = end - start;
-      // Not in middle to avoid clashes on set-associative caches on powers of 2.
-      size_t mid = (start + (9 * (n + 1)) / 16);
-      pardo(scheduler,
-            [&]() { parfor_(scheduler, start, mid, f, granularity, conservative); },
-            [&]() { parfor_(scheduler, mid, end, f, granularity, conservative); },
-            conservative);
-    }
-  }
-
 };
 
 }  // namespace parlay

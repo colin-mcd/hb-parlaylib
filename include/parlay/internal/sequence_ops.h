@@ -2,7 +2,6 @@
 #ifndef PARLAY_SEQUENCE_OPS_H_
 #define PARLAY_SEQUENCE_OPS_H_
 
-#include <cmath>
 #include <cstddef>
 
 #include <algorithm>
@@ -193,19 +192,17 @@ auto reduce(Seq const &A, Monoid&& m, flags fl = no_flag) {
   static_assert(is_random_access_range_v<Seq>);
   static_assert(is_monoid_for_v<Monoid, range_reference_type_t<Seq>>);
   using T = monoid_value_type_t<Monoid>;
-  size_t n = A.size();
-  size_t block_size = (std::max)(_block_size, 4 * static_cast<size_t>(std::ceil(std::sqrt(n))));
-  size_t l = num_blocks(n, block_size);
-  if (l == 0) return m.identity;
-  if (l == 1 || (fl & fl_sequential)) {
+  if (fl & fl_sequential)
     return reduce_serial(A, m);
-  }
-  auto sums = sequence<T>::uninitialized(l);
-  sliced_for(n, block_size, [&](size_t i, size_t s, size_t e) {
-    assign_uninitialized(sums[i], reduce_serial(make_slice(A).cut(s, e), m));
-  });
-  T r = internal::reduce(sums, m);
-  return r;
+
+  T result = m.identity;
+  spork::parfor(
+      size_t{0}, A.size(), result,
+      [&A, &m](size_t i, T& partial) {
+        partial = m(std::move(partial), A[i]);
+      },
+      std::move(m));
+  return result;
 }
 
 const flags fl_scan_inclusive = (1 << 4);
