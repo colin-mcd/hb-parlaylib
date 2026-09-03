@@ -141,8 +141,9 @@ static void par_do3_if(bool do_parallel, Lf&& left, Mf&& mid, Rf&& right) {
 #define PARLAY_USING_PARLAY_SCHEDULER
 
 #include "scheduler.h"
-
-#include "internal/work_stealing_job.h"
+#include "internal/spork_scheduler.h"
+#include "internal/spork_par.h"
+#include "internal/spork_parfor.h"
 
 
 namespace parlay {
@@ -189,18 +190,15 @@ inline size_t worker_id() {
 }
 
 template <typename F>
-inline void parallel_for(size_t start, size_t end, F&& f, long granularity, bool conservative) {
+inline void parallel_for(size_t start, size_t end, F&& f, long, bool conservative) {
   static_assert(std::is_invocable_v<F&, size_t>);
 
   if (start + 1 == end) {
     f(start);
   }
-  else if ((end - start) <= static_cast<size_t>(granularity)) {
-    for (size_t i = start; i < end; i++) f(i);
-  }
   else if (end > start) {
     fork_join_scheduler::parfor(internal::get_current_scheduler(), start, end,
-      std::forward<F>(f), static_cast<size_t>(granularity), conservative);
+      std::forward<F>(f), 0, conservative);
   }
 }
 
@@ -225,4 +223,4 @@ void execute_with_scheduler(unsigned int p, F&& f) {
 
 #endif
 
-#endif  // PARLAY_PARALELL_H_
+#endif  // PARLAY_PARALLEL_H_
