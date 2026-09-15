@@ -32,7 +32,9 @@
 // ehb2: idle workers must stay awake, because they are the only thing that
 // ever triggers a promotion (there is no timer to create work that would wake
 // a sleeper).  An idle worker keeps scanning deques and sending steal
-// requests instead of sleeping on the futex.
+// requests instead of sleeping on the futex.  (Measured: sleeping with a few
+// workers kept awake as requesters is time-neutral and saves almost no CPU on
+// PBBS, since a worker sleeps only after 10 ms of failed stealing.)
 #ifndef PARLAY_ELASTIC_PARALLELISM
 #define PARLAY_ELASTIC_PARALLELISM false
 #endif

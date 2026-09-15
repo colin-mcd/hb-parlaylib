@@ -40,7 +40,7 @@ namespace spork {
   // seeds a cascade of promotions across the thieves that pick those jobs up.
   // ehb2 is self-starting: constructing the scheduler sets everything up, so
   // programs need no startup call.
-  inline constexpr unsigned int REQUEST_GRANT_TOKENS = 60;   // SPORK_STEAL_REQUEST_TOKENS overrides
+  inline constexpr unsigned int REQUEST_GRANT_TOKENS = 64;   // SPORK_STEAL_REQUEST_TOKENS overrides; swept 8..256 at 80 cores, 64 best
   inline constinit thread_local volatile unsigned int promotion_tokens = 0;
   // Budget a worker grants itself after waiting at a join for a stolen job.
   // SPORK_JOIN_WARM_TOKENS overrides; 0 disables.

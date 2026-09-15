@@ -179,6 +179,15 @@ extern inline scheduler_type& get_current_scheduler() {
   return *current_scheduler;
 }
 
+// The default scheduler is constructed when the program loads (dynamic
+// initialization of this inline variable runs before main, and before any
+// later-defined global in any translation unit that includes this header).
+// parallel_for and par_do therefore call straight into Spork with no
+// scheduler lookup: the scheduler only has to exist by the time a promotion
+// enqueues a job, and it always does.  Other threads that call into parlay
+// still get a scheduler on demand through get_current_scheduler().
+inline scheduler_type& default_scheduler = get_current_scheduler();
+
 }  // namespace internal
 
 inline size_t num_workers() {
@@ -197,8 +206,7 @@ inline void parallel_for(size_t start, size_t end, F&& f, long, bool conservativ
     f(start);
   }
   else if (end > start) {
-    fork_join_scheduler::parfor(internal::get_current_scheduler(), start, end,
-      std::forward<F>(f), 0, conservative);
+    spork::parfor(start, end, [&f](size_t i) { f(i); });   // granularity ignored
   }
 }
 
@@ -206,7 +214,8 @@ template <typename Lf, typename Rf>
 inline void par_do(Lf&& left, Rf&& right, bool conservative) {
   static_assert(std::is_invocable_v<Lf&&>);
   static_assert(std::is_invocable_v<Rf&&>);
-  return fork_join_scheduler::pardo(internal::get_current_scheduler(), std::forward<Lf>(left), std::forward<Rf>(right), conservative);
+  spork::par([&]() { std::forward<Lf>(left)(); },
+             [&]() { std::forward<Rf>(right)(); });
 }
 
 // Execute the given function f() on p threads inside its own private scheduler instance
