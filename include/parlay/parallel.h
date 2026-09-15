@@ -85,12 +85,12 @@ inline void blocked_for(size_t start, size_t end, size_t block_size, F&& f, bool
 
 template <typename Lf, typename Rf>
 static void par_do_if(bool do_parallel, Lf&& left, Rf&& right, bool cons = false) {
-  if (do_parallel)
+  // if (do_parallel)
     par_do(std::forward<Lf>(left), std::forward<Rf>(right), cons);
-  else {
-    std::forward<Lf>(left)();
-    std::forward<Rf>(right)();
-  }
+  // else {
+  //   std::forward<Lf>(left)();
+  //   std::forward<Rf>(right)();
+  // }
 }
 
 template <typename Lf, typename Mf, typename Rf>
@@ -101,13 +101,13 @@ inline void par_do3(Lf&& left, Mf&& mid, Rf&& right) {
 
 template <typename Lf, typename Mf, typename Rf>
 static void par_do3_if(bool do_parallel, Lf&& left, Mf&& mid, Rf&& right) {
-  if (do_parallel)
+  // if (do_parallel)
     par_do3(std::forward<Lf>(left), std::forward<Mf>(mid), std::forward<Rf>(right));
-  else {
-    std::forward<Lf>(left)();
-    std::forward<Mf>(mid)();
-    std::forward<Rf>(right)();
-  }
+  // else {
+  //   std::forward<Lf>(left)();
+  //   std::forward<Mf>(mid)();
+  //   std::forward<Rf>(right)();
+  // }
 }
 
 }  // namespace parlay

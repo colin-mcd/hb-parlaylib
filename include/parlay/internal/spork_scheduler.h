@@ -29,9 +29,9 @@ namespace parlay {
 
 namespace spork {
 
-  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 30;
+  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 60;
   inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 500;
-  inline constexpr unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT * 1;
+  inline constexpr unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT * 4;
   inline constinit thread_local volatile unsigned int heartbeat_tokens = 0;
   inline constinit thread_local volatile bool disable_heartbeats = false;
 
