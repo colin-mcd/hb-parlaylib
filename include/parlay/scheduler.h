@@ -29,15 +29,29 @@
 // some startup lag when more parallelism becomes available.
 //
 // Default: true
+// ehb2: idle workers must stay awake, because they are the only thing that
+// ever triggers a promotion (there is no timer to create work that would wake
+// a sleeper).  An idle worker keeps scanning deques and sending steal
+// requests instead of sleeping on the futex.
 #ifndef PARLAY_ELASTIC_PARALLELISM
-#define PARLAY_ELASTIC_PARALLELISM true
+#define PARLAY_ELASTIC_PARALLELISM false
 #endif
 
 
 namespace spork {
-  void init_heartbeat_stats();
-  void start_heartbeats() noexcept;
-  void pause_heartbeats() noexcept;
+  // Defined in internal/spork_scheduler.h.
+  void init_steal_requests(unsigned int num_workers);
+  void register_worker(unsigned int id) noexcept;
+  void set_worker_busy(bool busy) noexcept;
+  bool promotion_is_blocked() noexcept;
+  void set_promotion_blocked(bool b) noexcept;
+  // steal-request protocol
+  bool steal_request_candidate(unsigned int victim) noexcept;
+  bool steal_request_begin(unsigned int victim) noexcept;
+  bool steal_request_answered(unsigned int victim) noexcept;
+  void steal_request_end(unsigned int victim) noexcept;
+  unsigned int steal_request_max_attempts() noexcept;
+  unsigned int steal_request_after() noexcept;
   template <typename LambdaL, typename LambdaR>
   void par(const LambdaL&& lamL, const LambdaR&& lamR);
   template <typename idx, typename BodyLambda>
@@ -124,17 +138,25 @@ struct scheduler {
         spawned_threads(),
         finished_flag(false) {
 
+    // Steal-request state for every worker, then register this thread as
+    // worker 0.  It is busy from now on: it runs the program's top-level
+    // code, which is where the first work to promote lives.
+    spork::init_steal_requests(num_threads);
+    spork::register_worker(0);
+    spork::set_worker_busy(true);
+
     // Spawn num_threads many threads on startup
     for (worker_id_type i = 1; i < num_threads; ++i) {
       spawned_threads.emplace_back([&, i]() {
         worker_info = {i, this};
+        spork::register_worker(i);
         worker();
       });
     }
   }
 
   ~scheduler() {
-    spork::pause_heartbeats();
+    spork::set_worker_busy(false);
     shutdown();
     worker_info = std::move(parent_worker_info);
   }
@@ -172,7 +194,14 @@ struct scheduler {
   // Pop from local stack.
   Job* get_own_job() {
     auto id = worker_id();
-    return deques[id].pop_bottom();
+    // A steal request served by signal during this pop would push onto the
+    // same deque; the owner-side push and pop are not reentrant, so hold
+    // promotions off for the duration (the request is answered as empty).
+    const bool was_blocked = spork::promotion_is_blocked();
+    spork::set_promotion_blocked(true);
+    Job* job = deques[id].pop_bottom();
+    spork::set_promotion_blocked(was_blocked);
+    return job;
   }
 
   worker_id_type num_workers() { return num_threads; }
@@ -262,16 +291,45 @@ struct scheduler {
   Job* steal_job(F&& break_early, bool timeout) {
     size_t id = worker_id();
     const auto start_time = std::chrono::steady_clock::now();
+    // Steal requests: after every burst of request_after failed random
+    // steals, ask a busy worker to promote.
+    const size_t request_after = num_deques * spork::steal_request_after();
+    size_t since_request = 0;
     do {
       // By coupon collector's problem, this should touch all.
       for (size_t i = 0; i <= YIELD_FACTOR * num_deques; i++) {
         if (break_early()) return nullptr;
         Job* job = try_steal(id);
         if (job) return job;
+        if (num_deques > 1 && ++since_request >= request_after) {
+          since_request = 0;
+          job = request_promotion(id);
+          if (job) return job;
+        }
       }
       std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
     } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
     return nullptr;
+  }
+
+  // Pick a random busy worker, interrupt it so that it promotes, and take the
+  // work it promotes.  Returns nullptr if no suitable victim was found, or the
+  // victim did not answer within a bounded number of attempts.  While waiting
+  // the requester keeps stealing randomly, so a request never costs it work
+  // appearing elsewhere.
+  Job* request_promotion(size_t id) {
+    size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
+    attempts[id].val++;
+    if (target == id || !spork::steal_request_candidate(target)) return nullptr;
+    if (!spork::steal_request_begin(target)) return nullptr;
+    Job* job = nullptr;
+    for (unsigned int n = spork::steal_request_max_attempts(); n > 0; --n) {
+      if ((job = deques[target].pop_top().first)) break;
+      if (spork::steal_request_answered(target)) { job = deques[target].pop_top().first; break; }
+      if ((job = try_steal(id))) break;
+    }
+    spork::steal_request_end(target);
+    return job;
   }
 
   Job* try_steal(size_t id) {
@@ -339,15 +397,6 @@ struct scheduler {
 
 }  // namespace parlay
 
-namespace spork {
-  void init_heartbeat_stats();
-  void start_heartbeats() noexcept;
-  void pause_heartbeats() noexcept;
-  template <typename LambdaL, typename LambdaR>
-  void par(const LambdaL&& lamL, const LambdaR&& lamR);
-  template <typename idx, typename BodyLambda>
-  void parfor(idx i, idx j, const BodyLambda&& body);
-}
 
 namespace parlay {
 

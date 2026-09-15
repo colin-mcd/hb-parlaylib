@@ -114,12 +114,12 @@ namespace { // private
 
         r.i = mid;
         r.j = j;
-        r.enqueue((heartbeat_tokens + 1) >> 1);
+        r.enqueue((promotion_tokens + 1) >> 1);
 
         if (prom_i >= mid) { l.i = 0; l.j = 0; return; }
         l.i = prom_i;
         l.j = mid;
-        l.enqueue(heartbeat_tokens);
+        l.enqueue(promotion_tokens);
       });
     if (promoted) [[unlikely]] {
       if (l.i < l.j) [[likely]] {

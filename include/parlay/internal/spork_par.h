@@ -32,7 +32,7 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
 
   bool promoted = with_prom_handler(
     fwd(lamL),
-    [&jp] () { jp.enqueue(heartbeat_tokens >> 1); });
+    [&jp] () { jp.enqueue(promotion_tokens >> 1); });
 
   if (promoted) [[unlikely]] { // promoted
     jp.sync(false);
