@@ -35,7 +35,7 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
     [&jp] () { jp.enqueue(heartbeat_tokens >> 1); });
 
   if (promoted) [[unlikely]] { // promoted
-    jp.sync(false);
+    jp.sync(true); // was false
   } else [[likely]] { // unpromoted
     fwd(lamR)();
   }

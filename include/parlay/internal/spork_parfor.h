@@ -127,7 +127,7 @@ namespace { // private
         a = fwd(binop)(a, l.a);
       }
       if (r.i < r.j) [[likely]] {
-        r.sync(false);
+        r.sync(true); // was false
         a = fwd(binop)(a, r.a);
       }
     }
