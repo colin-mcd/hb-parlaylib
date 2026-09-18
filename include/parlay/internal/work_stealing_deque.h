@@ -36,6 +36,10 @@ struct Deque {
   // align to avoid false sharing
   struct alignas(64) padded_job {
     std::atomic<Job*> job;
+    // Copy of the job's nearest ancestors, written by the owner at push time,
+    // so a thief can test lineage without dereferencing the job (which may
+    // already have been popped and destroyed by the owner).
+    const Job* ancestors[Job::ANCESTORS];
   };
 
   static constexpr int q_size = 1000;
@@ -52,6 +56,7 @@ struct Deque {
   // Returns true if the queue was empty before this push
   bool push_bottom(Job* job) {
     auto local_bot = bot.load(std::memory_order_acquire);      // atomic load
+    for (int i = 0; i < Job::ANCESTORS; i++) deq[local_bot].ancestors[i] = job->anc[i];
     deq[local_bot].job.store(job, std::memory_order_release);  // shared store
     local_bot += 1;
     if (local_bot == q_size) {
@@ -68,10 +73,20 @@ struct Deque {
   // Returns {job, empty}, where empty is true if job was the
   // only job on the queue, i.e., the queue is now empty
   std::pair<Job*, bool> pop_top() {
+    return pop_top_if([](const Job* const*) { return true; });
+  }
+
+  // Take the top job only if accept(ancestors) holds for the ancestor list
+  // stored in its slot.  Only slot memory is read before the CAS on age; the
+  // CAS succeeds only if the slot was not taken or popped meanwhile, so the
+  // job returned is exactly the one whose ancestors were accepted.
+  template <typename Accept>
+  std::pair<Job*, bool> pop_top_if(Accept&& accept) {
     auto old_age = age.load(std::memory_order_acquire);    // atomic load
     auto local_bot = bot.load(std::memory_order_acquire);  // atomic load
     if (local_bot > old_age.top) {
       auto job = deq[old_age.top].job.load(std::memory_order_acquire);  // atomic load
+      if (!accept(static_cast<const Job* const*>(deq[old_age.top].ancestors))) return {nullptr, false};
       auto new_age = old_age;
       new_age.top = new_age.top + 1;
       if (age.compare_exchange_strong(old_age, new_age))

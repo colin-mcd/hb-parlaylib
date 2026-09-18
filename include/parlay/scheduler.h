@@ -54,6 +54,10 @@ namespace spork {
   void steal_request_end(unsigned int victim) noexcept;
   unsigned int steal_request_max_attempts() noexcept;
   unsigned int steal_request_after() noexcept;
+  unsigned int steal_request_after_abs() noexcept;
+  unsigned int join_leapfrog() noexcept;
+  unsigned int join_request_after() noexcept;
+  unsigned int join_fallback_after() noexcept;
   template <typename LambdaL, typename LambdaR>
   void par(const LambdaL&& lamL, const LambdaR&& lamR);
   template <typename idx, typename BodyLambda>
@@ -137,6 +141,7 @@ struct scheduler {
         parent_worker_info(std::exchange(worker_info, workerInfo{0, this})),
         deques(num_deques),
         attempts(num_deques),
+        waiting_on(num_deques),
         spawned_threads(),
         finished_flag(false) {
 
@@ -224,6 +229,10 @@ struct scheduler {
   workerInfo parent_worker_info;
   std::vector<internal::Deque<Job>> deques;
   std::vector<attempt> attempts;
+  // The job each worker is currently waiting for at a leapfrogging join, or
+  // null.  A joiner follows these to find the worker holding its descendants.
+  struct alignas(128) waiting_slot { std::atomic<const Job*> job{nullptr}; };
+  std::vector<waiting_slot> waiting_on;
   std::vector<std::thread> spawned_threads;
   std::atomic<int> finished_flag;
 
@@ -295,7 +304,9 @@ struct scheduler {
     const auto start_time = std::chrono::steady_clock::now();
     // Steal requests: after every burst of request_after failed random
     // steals, ask a busy worker to promote.
-    const size_t request_after = num_deques * spork::steal_request_after();
+    const size_t request_after = spork::steal_request_after_abs()
+                                   ? spork::steal_request_after_abs()
+                                   : num_deques * spork::steal_request_after();
     size_t since_request = 0;
     do {
       // By coupon collector's problem, this should touch all.
@@ -323,16 +334,90 @@ struct scheduler {
     size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
     attempts[id].val++;
     if (target == id || !spork::steal_request_candidate(target)) return nullptr;
+    return request_promotion_from(id, target, true);
+  }
+
+  // Ask `target` specifically.  With steal_elsewhere, keep stealing at random
+  // while waiting; a leapfrogging joiner must not, since unrelated work is
+  // exactly what it is avoiding.
+  Job* request_promotion_from(size_t id, size_t target, bool steal_elsewhere,
+                              const Job* ancestor = nullptr) {
     if (!spork::steal_request_begin(target)) return nullptr;
+    auto accept = [ancestor](const Job* const* a) { return ancestor == nullptr || Job::descends(a, ancestor); };
     Job* job = nullptr;
     for (unsigned int n = spork::steal_request_max_attempts(); n > 0; --n) {
-      if ((job = deques[target].pop_top().first)) break;
-      if (spork::steal_request_answered(target)) { job = deques[target].pop_top().first; break; }
-      if ((job = try_steal(id))) break;
+      if ((job = deques[target].pop_top_if(accept).first)) break;
+      if (spork::steal_request_answered(target)) { job = deques[target].pop_top_if(accept).first; break; }
+      if (steal_elsewhere && (job = try_steal(id))) break;
     }
     spork::steal_request_end(target);
     return job;
   }
+
+  // One random steal attempt that only takes a descendant of `ancestor`.
+  Job* try_steal_descendant(size_t id, const Job* ancestor) {
+    size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
+    attempts[id].val++;
+    return deques[target].pop_top_if([ancestor](const Job* const* a) { return Job::descends(a, ancestor); }).first;
+  }
+
+ public:
+  // Wait for `job` (stolen by another worker) to finish, helping only with
+  // work descended from it: steal from the deque of the worker that took it,
+  // or, if that worker is itself waiting at a join, from the thief of the job
+  // it waits for, and so on down the chain.  When the worker at the end of
+  // the chain is running with nothing in its deque, ask it to promote.  Any
+  // job obtained this way is part of the subtree the join is waiting for.
+  // Modes (spork::join_leapfrog()): 1 steal descendants only; 2 also send a
+  // targeted request after a burst of empty polls; 3 as 2 plus one random
+  // steal as a fallback on every empty poll; 4 as 2 with the fallback only
+  // after the burst; 5 as 2 but every job taken is checked to descend from
+  // the awaited one (closing the race where the thief has moved on); 6 as 5
+  // plus random steal attempts that accept only descendants, so descendant
+  // work held by workers the chain cannot see is found too; 9 just spin.
+  void wait_leapfrog(const Job* job) {
+    const size_t id = worker_id();
+    const unsigned mode = spork::join_leapfrog();
+    const bool checked = (mode == 5 || mode == 6);
+    const Job* ancestor = checked ? job : nullptr;
+    auto accept = [ancestor](const Job* const* a) { return ancestor == nullptr || Job::descends(a, ancestor); };
+    const size_t request_after = spork::join_request_after();   // empty polls before asking the thief
+    const size_t fallback_after = spork::join_fallback_after(); // empty polls before unrelated work (mode 4)
+    size_t empty_polls = 0;
+    waiting_on[id].job.store(job, std::memory_order_release);
+    while (!job->finished()) {
+      if (mode == 9) { __builtin_ia32_pause(); continue; }
+      size_t target = job->thief;
+      Job* got = nullptr;
+      for (int hops = 0; hops < 8 && target < static_cast<size_t>(num_deques) && target != id; ++hops) {
+        if ((got = deques[target].pop_top_if(accept).first)) break;
+        const Job* w = waiting_on[target].job.load(std::memory_order_acquire);
+        if (w == nullptr) break;   // running: it may hold promotable descendants
+        target = w->thief;         // waiting: its descendants live with that thief
+      }
+      // One request attempt per burst of empty polls.  The counter is reset
+      // whether or not the attempt succeeds: the candidate check reads the
+      // victim's spork-deque pointer, a line the victim writes on every
+      // fork, and polling it on every iteration from many joiners slowed
+      // the victim's own loops by 2-3x (wordCounts at 80 cores).
+      if (!got && mode >= 2 && ++empty_polls >= request_after) {
+        empty_polls = 0;
+        if (target < static_cast<size_t>(num_deques) && target != id &&
+            spork::steal_request_candidate(target))
+          got = request_promotion_from(id, target, false, ancestor);
+      }
+      if (!got && mode == 6) got = try_steal_descendant(id, job);
+      // Fallback to unrelated work: mode 3 on every empty poll, mode 4 only
+      // once a burst of empty polls has passed without a targeted request
+      // yielding anything (the request fires on the same threshold).
+      if (!got && (mode == 3 || (mode == 4 && empty_polls + 1 >= fallback_after))) got = try_steal(id);
+      if (got) { empty_polls = 0; (*got)(); continue; }
+      __builtin_ia32_pause();
+    }
+    waiting_on[id].job.store(nullptr, std::memory_order_release);
+  }
+
+ private:
 
   Job* try_steal(size_t id) {
     // use hashing to get "random" target

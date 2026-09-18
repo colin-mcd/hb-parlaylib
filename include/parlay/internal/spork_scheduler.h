@@ -43,6 +43,44 @@ namespace spork {
   // Budget a worker grants itself after waiting at a join for a stolen job.
   // SPORK_JOIN_WARM_TOKENS overrides; 0 disables.
   inline unsigned int JOIN_WARM_TOKENS = 128;
+  // How the warm budget is chosen (SPORK_JOIN_WARM_MODE): 0 none; 1 the
+  // fixed JOIN_WARM_TOKENS; 2 an estimate of the number of idle workers, so
+  // that every warm token is charged to an idle processor; 3 and 4 as 1 and
+  // 2 but only at a true region end (the worker is running no job), not at
+  // the outermost join of a stolen job.  The estimate samples
+  // JOIN_IDLE_SAMPLES workers' busy flags (no shared writes: a shared
+  // counter cost 20% on delaunay from contention at region boundaries).
+  inline unsigned int JOIN_WARM_MODE = 2;
+  inline unsigned int JOIN_IDLE_SAMPLES = 16;   // SPORK_JOIN_IDLE_SAMPLES
+  inline unsigned int estimate_idle_workers() noexcept;
+  // Leapfrogging at joins.  0: a worker waiting for a stolen job helps with
+  // any work it can steal (it may then be stuck in unrelated work long after
+  // its child finished).  1: it helps only with work descended from the
+  // awaited child: it steals from the thief that took the child, following
+  // the chain of thieves if that one is itself waiting, and sends its steal
+  // request to that worker rather than to a random one; otherwise it waits.
+  // 2: as 1, but falls back to one random steal when no descendant work is
+  // available.  SPORK_JOIN_LEAPFROG overrides.
+  inline unsigned int JOIN_LEAPFROG = 6;
+  inline unsigned int join_leapfrog() noexcept { return JOIN_LEAPFROG; }
+  // Empty polls of the thief's deque before a joiner sends it a targeted
+  // request (SPORK_JOIN_REQUEST_AFTER), and before it falls back to one
+  // random steal of unrelated work in mode 4 (SPORK_JOIN_FALLBACK_AFTER).
+  inline unsigned int JOIN_REQUEST_AFTER = 4096;
+  inline unsigned int JOIN_FALLBACK_AFTER = 1024;
+  inline unsigned int join_request_after() noexcept { return JOIN_REQUEST_AFTER; }
+  inline unsigned int join_fallback_after() noexcept { return JOIN_FALLBACK_AFTER; }
+  inline constexpr unsigned int NO_THIEF = ~0u;
+  struct WorkStealingJob;
+  // The job the calling worker is currently executing (null outside any job).
+  // A job created by a promotion records it as its parent, which lets a
+  // joiner test whether a job it finds descends from the child it waits for.
+  inline constinit thread_local const WorkStealingJob* current_job = nullptr;
+  // The current job's ancestry (itself first), kept thread-local so that a
+  // promotion copies it from cache-hot memory.  Copying from the job object
+  // instead, which lives in a frame on another worker's stack, cost
+  // wordCounts 20% at 80 cores (350k promotions per run).
+  inline constinit thread_local const WorkStealingJob* current_ancestry[8] = {};
   inline bool at_outermost_level() noexcept;
   // Set while this thread must not be interrupted by a promotion: while it
   // promotes a slot itself (so a request cannot promote the same slot twice)
@@ -79,10 +117,19 @@ struct WorkStealingJob {
   WorkStealingJob() {}
 
   void operator()() {
+    thief = worker_id();   // lets a joiner find where this job's descendants live
+    const WorkStealingJob* const enclosing = current_job;   // jobs run nested inside waits
+    const WorkStealingJob* saved_ancestry[ANCESTORS];
+    for (int i = 0; i < ANCESTORS; i++) saved_ancestry[i] = current_ancestry[i];
+    current_job = this;
+    current_ancestry[0] = this;
+    for (int i = 1; i < ANCESTORS; i++) current_ancestry[i] = anc[i - 1];
     promotion_tokens = hbt;
     set_worker_busy(true);
     run();
     set_worker_busy(false);
+    current_job = enclosing;
+    for (int i = 0; i < ANCESTORS; i++) current_ancestry[i] = saved_ancestry[i];
     bool was_done = done.test_and_set(std::memory_order_release);
     assert(!was_done);
   }
@@ -93,12 +140,18 @@ struct WorkStealingJob {
 
   void wait() const noexcept {
     set_worker_busy(false);
-    auto done = [&] () { return finished(); };
-    get_current_scheduler().wait_until(done);
+    if (JOIN_LEAPFROG) {
+      get_current_scheduler().wait_leapfrog(this);
+    } else {
+      auto done = [&] () { return finished(); };
+      get_current_scheduler().wait_until(done);
+    }
     set_worker_busy(true);
   }
 
   void enqueue(unsigned int with_tokens = 0) {
+    // Nearest ancestors: the creating job first, then its ancestors.
+    for (int i = 0; i < ANCESTORS; i++) anc[i] = current_ancestry[i];
     hbt = with_tokens;
     if (with_tokens) promotion_tokens = promotion_tokens - with_tokens;
     get_current_scheduler().spawn(this);
@@ -124,7 +177,11 @@ struct WorkStealingJob {
         // rather than a join inside one), this worker knows idle workers are
         // hungry and carries a budget into the next region, which then
         // spreads eagerly without waiting for a steal request.
-        if (at_outermost_level() && promotion_tokens < JOIN_WARM_TOKENS) promotion_tokens = JOIN_WARM_TOKENS;
+        if (at_outermost_level() && (JOIN_WARM_MODE <= 2 || current_job == nullptr)) {
+          const unsigned int warm = (JOIN_WARM_MODE == 2 || JOIN_WARM_MODE == 4) ? estimate_idle_workers()
+                                  : (JOIN_WARM_MODE == 1 || JOIN_WARM_MODE == 3) ? JOIN_WARM_TOKENS : 0;
+          if (promotion_tokens < warm) promotion_tokens = warm;
+        }
       }
     }
   }
@@ -140,6 +197,17 @@ struct WorkStealingJob {
   virtual void run() = 0;
   volatile std::atomic_flag done;
   volatile unsigned int hbt; // promotion tokens this job carries to whoever runs it
+  volatile unsigned int thief = NO_THIEF; // worker running this job, once it has started
+  // The ANCESTORS nearest ancestors (creating job first), recorded at
+  // creation.  A job more than ANCESTORS levels below a given ancestor is
+  // conservatively treated as unrelated to it.
+  static constexpr int ANCESTORS = 8;
+  const WorkStealingJob* anc[ANCESTORS];   // written by enqueue(), before the job is visible to thieves
+
+  static bool descends(const WorkStealingJob* const* ancestors, const WorkStealingJob* ancestor) noexcept {
+    for (int i = 0; i < ANCESTORS; i++) if (ancestors[i] == ancestor) return true;
+    return false;
+  }
 };
 
   struct PromFn {
@@ -191,6 +259,7 @@ struct WorkStealingJob {
     // once it has promoted (or found nothing), which both acknowledges the
     // request and releases the victim for the next requester.
     std::atomic<bool> pending{false};
+    bool inflight_slot = false;          // this request holds an in-flight slot (requester-private while pending)
     // Requesters skip this victim until this steady-clock time: one request
     // per STEAL_REQUEST_GAP_US per victim, however many thieves are idle.
     std::atomic<long long> not_before_ns{0};
@@ -212,6 +281,17 @@ struct WorkStealingJob {
   // trade off against each other across workloads; the rest are fixed.
   inline bool steal_requests_enabled = true;                   // SPORK_STEAL_REQUESTS=0 disables
   inline unsigned int STEAL_REQUEST_TOKENS = REQUEST_GRANT_TOKENS;  // SPORK_STEAL_REQUEST_TOKENS
+  // Request threshold: a constant number of failed steals
+  // (SPORK_STEAL_REQUEST_AFTER_ABS, 0 = unused) or, failing that, a multiple
+  // of the worker count (SPORK_STEAL_REQUEST_AFTER).  The multiple exists to
+  // bound signal pressure; with an in-flight cap that job moves to the cap
+  // and the threshold only sets request latency.
+  inline unsigned int STEAL_REQUEST_AFTER_ABS = 256;   // grid-swept with the cap at 80 cores: 256 x K=4 best
+  // At most this many requests in flight process-wide (0 = unbounded), so
+  // signal delivery, which serialises on the kernel's per-process lock, has
+  // bounded latency independent of the worker count.  SPORK_STEAL_REQUEST_INFLIGHT.
+  inline unsigned int STEAL_REQUEST_INFLIGHT = 4;
+  inline constinit std::atomic<unsigned int> inflight_requests{0};
   inline unsigned int STEAL_REQUEST_AFTER = 64;                // SPORK_STEAL_REQUEST_AFTER: failed steal
                                                                // passes (x workers) before the first request
   // Bound on waiting for an answer, in steal attempts rather than time so the
@@ -226,10 +306,34 @@ struct WorkStealingJob {
   inline constexpr unsigned int STEAL_REQUEST_MAX_ATTEMPTS = 32000;
   inline constexpr unsigned int STEAL_REQUEST_GAP_US = 20;       // minimum spacing of requests per victim
   inline unsigned int steal_request_after() noexcept { return STEAL_REQUEST_AFTER; }
+  inline unsigned int steal_request_after_abs() noexcept { return STEAL_REQUEST_AFTER_ABS; }
   inline unsigned int steal_request_max_attempts() noexcept { return STEAL_REQUEST_MAX_ATTEMPTS; }
   inline long long steal_request_now_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  // Number of idle workers: exact when there are at most JOIN_IDLE_SAMPLES
+  // workers (every busy flag is read), otherwise estimated from that many
+  // distinct, evenly spaced workers starting at a random one.
+  inline unsigned int estimate_idle_workers() noexcept {
+    const unsigned int n = num_worker_request_states;
+    if (n == 0) return 0;
+    unsigned int idle = 0;
+    if (n <= JOIN_IDLE_SAMPLES) {
+      for (unsigned int i = 0; i < n; i++)
+        if (!worker_request_states[i].busy.load(std::memory_order_relaxed)) idle++;
+      return idle;
+    }
+    static thread_local unsigned int seed = 0x9E3779B9u * (WorkStealingJob::worker_id() + 1);
+    seed = seed * 1664525u + 1013904223u;
+    const unsigned int k = JOIN_IDLE_SAMPLES, step = n / k;   // step * k <= n: indices are distinct
+    unsigned int i = (seed >> 8) % n;
+    for (unsigned int j = 0; j < k; j++, i += step) {
+      if (i >= n) i -= n;
+      if (!worker_request_states[i].busy.load(std::memory_order_relaxed)) idle++;
+    }
+    return (unsigned int)(((unsigned long long)idle * n) / k);
   }
 
   inline WorkerRequestState* request_state(unsigned int worker) noexcept {
@@ -261,6 +365,14 @@ struct WorkStealingJob {
       st->pending.store(false, std::memory_order_release);
       return false;
     }
+    if (STEAL_REQUEST_INFLIGHT) {   // claim an in-flight slot, or withdraw
+      unsigned int n = inflight_requests.load(std::memory_order_relaxed);
+      while (true) {
+        if (n >= STEAL_REQUEST_INFLIGHT) { st->pending.store(false, std::memory_order_release); return false; }
+        if (inflight_requests.compare_exchange_weak(n, n + 1, std::memory_order_acq_rel)) break;
+      }
+      st->inflight_slot = true;
+    }
     static const pid_t pid = getpid();
     syscall(SYS_tgkill, pid, st->tid, SIGALRM);
     return true;
@@ -280,6 +392,7 @@ struct WorkStealingJob {
   inline void steal_request_end(unsigned int victim) noexcept {
     WorkerRequestState* st = request_state(victim);
     if (!st) return;
+    if (st->inflight_slot) { st->inflight_slot = false; inflight_requests.fetch_sub(1, std::memory_order_acq_rel); }
     if (st->pending.load(std::memory_order_acquire)) {
       st->not_before_ns.store(steal_request_now_ns() + STEAL_REQUEST_GAP_US * 1000LL, std::memory_order_relaxed);
       st->pending.store(false, std::memory_order_release);
@@ -295,7 +408,14 @@ struct WorkStealingJob {
     if (const char* e = std::getenv("SPORK_STEAL_REQUESTS")) steal_requests_enabled = std::atoi(e) != 0;
     if (const char* e = std::getenv("SPORK_STEAL_REQUEST_TOKENS")) STEAL_REQUEST_TOKENS = std::max(1, std::atoi(e));
     if (const char* e = std::getenv("SPORK_STEAL_REQUEST_AFTER")) STEAL_REQUEST_AFTER = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_STEAL_REQUEST_AFTER_ABS")) STEAL_REQUEST_AFTER_ABS = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_STEAL_REQUEST_INFLIGHT")) STEAL_REQUEST_INFLIGHT = std::max(0, std::atoi(e));
     if (const char* e = std::getenv("SPORK_JOIN_WARM_TOKENS")) JOIN_WARM_TOKENS = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_WARM_MODE")) JOIN_WARM_MODE = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_IDLE_SAMPLES")) JOIN_IDLE_SAMPLES = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_LEAPFROG")) JOIN_LEAPFROG = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_REQUEST_AFTER")) JOIN_REQUEST_AFTER = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_FALLBACK_AFTER")) JOIN_FALLBACK_AFTER = std::max(1, std::atoi(e));
     worker_request_states = new WorkerRequestState[nw];
     num_worker_request_states = nw;
     struct sigaction sa = {};
