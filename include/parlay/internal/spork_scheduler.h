@@ -30,11 +30,18 @@ namespace parlay {
 
 namespace spork {
 
-  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 32;
-  inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 500;
+  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 64;
+  inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 250;
   // inline constexpr unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT * 100000;
   inline constinit thread_local volatile unsigned int heartbeat_tokens = 0;
+
+  // true => this *job* must not be promoted; used during eager promotions to prevent signal-delivered heartbeats from promoting simultaneously
   inline constinit thread_local volatile bool disable_heartbeats = false;
+  // true => this *processor* (= thread) is between jobs
+  inline constinit thread_local volatile bool heartbeats_idle = true;
+  // true => the *scheduler* is done, e.g., at end of program
+  inline constinit std::atomic<bool> heartbeats_done = false;
+
   // At a join, add the tokens a stolen child had left when it finished to
   // the continuation's pool, so tokens are never lost on a thief.
   // SPORK_JOIN_COLLECT=0 disables.
@@ -42,6 +49,7 @@ namespace spork {
 
 inline void start_heartbeats() noexcept;
 inline void pause_heartbeats() noexcept;
+inline void stop_heartbeats() noexcept;
 
 struct WorkStealingJob {
   using scheduler_t = parlay::scheduler<WorkStealingJob>;
@@ -296,8 +304,9 @@ struct WorkStealingJob {
   }
 
   inline void heartbeat_handler(int sig) {
+    if (heartbeats_done.load(std::memory_order_relaxed)) return;
     int saved_errno = errno;
-    if (!disable_heartbeats) {
+    if (!disable_heartbeats && !heartbeats_idle) {
 #ifdef RECORD_HEARTBEAT_STATS
       volatile unsigned int& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
       hbs = hbs + 1;
@@ -317,6 +326,7 @@ struct WorkStealingJob {
   }
 
   inline constinit thread_local timer_t heartbeat_timer;
+  inline constinit thread_local bool heartbeat_timer_live = false;
   inline constinit itimerspec heartbeat_its_zero = {};
 
   consteval itimerspec init_heartbeat_its() {
@@ -344,13 +354,26 @@ inline void start_heartbeats() noexcept {
     sev._sigev_un._tid = gettid();
 
     timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
+    heartbeat_timer_live = true;
+    timer_settime(heartbeat_timer, 0, &heartbeat_its, nullptr);
   }
 
-  timer_settime(heartbeat_timer, 0, &heartbeat_its, nullptr);
+  heartbeats_idle = false;
 }
 
 inline void pause_heartbeats() noexcept {
-  timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
+  heartbeats_idle = true;
+}
+
+// Disarm for good: called when a worker leaves the scheduler, and by the main
+// thread when the scheduler shuts down.
+inline void stop_heartbeats() noexcept {
+  heartbeats_idle = true;
+  if (heartbeat_timer_live) {
+    timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
+    timer_delete(heartbeat_timer);
+    heartbeat_timer_live = false;
+  }
 }
 
 template <typename BodyLambda, typename PromLambda>

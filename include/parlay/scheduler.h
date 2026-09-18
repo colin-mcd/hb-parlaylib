@@ -37,6 +37,8 @@
 namespace spork {
   void init_heartbeat_stats();
   void start_heartbeats() noexcept;
+  void stop_heartbeats() noexcept;
+  extern std::atomic<bool> heartbeats_done;
   void pause_heartbeats() noexcept;
   template <typename LambdaL, typename LambdaR>
   void par(const LambdaL&& lamL, const LambdaR&& lamR);
@@ -134,6 +136,8 @@ struct scheduler {
   }
 
   ~scheduler() {
+    spork::heartbeats_done.store(true, std::memory_order_relaxed);
+    spork::stop_heartbeats();
     spork::pause_heartbeats();
     shutdown();
     worker_info = std::move(parent_worker_info);
@@ -219,6 +223,7 @@ struct scheduler {
 #endif
     }
     assert(finished());
+    spork::stop_heartbeats();   // no beats once this worker leaves
     num_finished_workers.fetch_add(1);
   }
 
@@ -336,20 +341,6 @@ struct scheduler {
     }
   }
 };
-
-}  // namespace parlay
-
-namespace spork {
-  void init_heartbeat_stats();
-  void start_heartbeats() noexcept;
-  void pause_heartbeats() noexcept;
-  template <typename LambdaL, typename LambdaR>
-  void par(const LambdaL&& lamL, const LambdaR&& lamR);
-  template <typename idx, typename BodyLambda>
-  void parfor(idx i, idx j, const BodyLambda&& body);
-}
-
-namespace parlay {
 
 class fork_join_scheduler {
   using Job = WorkStealingJob;
