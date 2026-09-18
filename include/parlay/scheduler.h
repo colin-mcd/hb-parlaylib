@@ -54,6 +54,9 @@ namespace spork {
   void steal_request_end(unsigned int victim) noexcept;
   unsigned int steal_request_max_attempts() noexcept;
   unsigned int steal_request_after() noexcept;
+  unsigned int steal_request_after_abs() noexcept;
+  struct WorkStealingJob;
+  void run_job(WorkStealingJob* job);   // runs a job on a fiber (internal/spork_scheduler.h)
   template <typename LambdaL, typename LambdaR>
   void par(const LambdaL&& lamL, const LambdaR&& lamR);
   template <typename idx, typename BodyLambda>
@@ -240,7 +243,7 @@ struct scheduler {
 #endif
     while (!finished()) {
       Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
-      if (job)(*job)();
+      if (job) spork::run_job(job);
 #if PARLAY_ELASTIC_PARALLELISM
       else if (!finished()) {
         // If no job was stolen, the worker should go to
@@ -265,7 +268,7 @@ struct scheduler {
     while (true) {
       Job* job = get_job(done, false);  // timeout MUST BE false
       if (!job) return;
-      (*job)();
+      spork::run_job(job);
     }
     assert(done());
   }
@@ -295,7 +298,9 @@ struct scheduler {
     const auto start_time = std::chrono::steady_clock::now();
     // Steal requests: after every burst of request_after failed random
     // steals, ask a busy worker to promote.
-    const size_t request_after = num_deques * spork::steal_request_after();
+    const size_t request_after = spork::steal_request_after_abs()
+                                   ? spork::steal_request_after_abs()
+                                   : num_deques * spork::steal_request_after();
     size_t since_request = 0;
     do {
       // By coupon collector's problem, this should touch all.
@@ -323,16 +328,25 @@ struct scheduler {
     size_t target = (hash(id) + hash(attempts[id].val)) % num_deques;
     attempts[id].val++;
     if (target == id || !spork::steal_request_candidate(target)) return nullptr;
+    return request_promotion_from(id, target, true);
+  }
+
+  // Ask `target` specifically.  With steal_elsewhere, keep stealing at random
+  // while waiting; a leapfrogging joiner must not, since unrelated work is
+  // exactly what it is avoiding.
+  Job* request_promotion_from(size_t id, size_t target, bool steal_elsewhere) {
     if (!spork::steal_request_begin(target)) return nullptr;
     Job* job = nullptr;
     for (unsigned int n = spork::steal_request_max_attempts(); n > 0; --n) {
       if ((job = deques[target].pop_top().first)) break;
       if (spork::steal_request_answered(target)) { job = deques[target].pop_top().first; break; }
-      if ((job = try_steal(id))) break;
+      if (steal_elsewhere && (job = try_steal(id))) break;
     }
     spork::steal_request_end(target);
     return job;
   }
+
+ private:
 
   Job* try_steal(size_t id) {
     // use hashing to get "random" target

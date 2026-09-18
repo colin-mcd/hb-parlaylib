@@ -21,7 +21,7 @@ class async_signal_safe_pointer {
     return p;
   }
 
-  inline consteval async_signal_safe_pointer() noexcept : ptr(nullptr) {}
+  inline constexpr async_signal_safe_pointer() noexcept : ptr(nullptr) {}
 
   inline async_signal_safe_pointer(T* p) noexcept {
     store(p);
