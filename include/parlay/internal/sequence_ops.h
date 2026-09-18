@@ -153,7 +153,13 @@ auto copy(Seq const &A, Range R, flags) -> void {
   parallel_for(0, A.size(), [&](size_t i) { R[i] = A[i]; });
 }
 
+#ifdef NOGRAINS_SCAN
+// Parallelism grain removed; see the recursive combine in scan_ below, which
+// is what makes a block this small sound.
+constexpr const size_t _log_block_size = 1;
+#else
 constexpr const size_t _log_block_size = 10;
+#endif
 constexpr const size_t _block_size = (1 << _log_block_size);
 
 inline size_t num_blocks(size_t n, size_t block_size) {
@@ -247,7 +253,13 @@ auto scan_(In_Seq const &In, Out_Range Out, Monoid&& m, flags fl, bool out_unini
   sliced_for(n, _block_size, [&](size_t i, size_t s, size_t e) {
     assign_uninitialized(sums[i], reduce_serial(make_slice(In).cut(s, e), m));
   });
+#ifdef NOGRAINS_SCAN
+  // The combine is the whole reason the block cannot simply be made smaller;
+  // recursing here is what removes the grain rather than just shrinking it.
+  T total = scan_(make_slice(sums), make_slice(sums), m, 0, false);
+#else
   T total = scan_serial(sums, make_slice(sums), m, m.identity, 0, false);
+#endif
   sliced_for(n, _block_size, [&](size_t i, size_t s, size_t e) {
     auto O = make_slice(Out).cut(s, e);
     scan_serial(make_slice(In).cut(s, e), O, m, sums[i], fl, out_uninitialized);

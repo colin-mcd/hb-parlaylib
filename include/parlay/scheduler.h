@@ -35,6 +35,8 @@
 
 
 namespace spork {
+  struct WorkStealingJob;
+  void run_job(WorkStealingJob* job);   // runs a job on a fiber (internal/spork_scheduler.h)
   void init_heartbeat_stats();
   void start_heartbeats() noexcept;
   void stop_heartbeats() noexcept;
@@ -213,7 +215,7 @@ struct scheduler {
 #endif
     while (!finished()) {
       Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
-      if (job)(*job)();
+      if (job) spork::run_job(job);
 #if PARLAY_ELASTIC_PARALLELISM
       else if (!finished()) {
         // If no job was stolen, the worker should go to
@@ -239,7 +241,7 @@ struct scheduler {
     while (true) {
       Job* job = get_job(done, false);  // timeout MUST BE false
       if (!job) return;
-      (*job)();
+      spork::run_job(job);
     }
     assert(done());
   }

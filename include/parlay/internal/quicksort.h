@@ -160,8 +160,17 @@ void quicksort_serial(Iterator A, size_t n, const BinPred& f) {
 
 template <class Iterator, class BinPred>
 void quicksort(Iterator A, size_t n, const BinPred& f) {
+#ifdef NOGRAINS
+  // Parallelism grain removed.  quicksort_serial performs exactly the same
+  // split3 partitions as the loop below, so stopping at 256 only reduces the
+  // task count; recurse in parallel down to the insertion-sort base case,
+  // which is an algorithmic grain and stays.
+  if (base_case(A, n))
+    insertion_sort(A, n, f);
+#else
   if (n < (1 << 8))
     quicksort_serial(A, n, f);
+#endif
   else {
     auto [L, M, mid_eq] = split3(A, n, f);
     // Note: generic lambda capture for L and M (i.e. writing L = L, etc.)
