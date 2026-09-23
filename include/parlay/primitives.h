@@ -808,12 +808,6 @@ auto min_element(R&& r, Compare&& comp) {
   auto SS = delayed_seq<size_t>(n, [&](size_t i) { return i; });
   auto f = [&comp, it = std::begin(r)](size_t l, size_t r)
     { return (!comp(it[r], it[l]) ? l : r); };
-  // The identity is index 0 rather than the placeholder index n (one past the
-  // end).  Stock parlaylib's reduce seeds each block with its first element and
-  // never applies the combine function to the identity, so a placeholder was
-  // safe there; spork's reduce does combine it, and f would then read it[n].
-  // Index 0 is already part of the range, so folding it in is a no-op for
-  // argmin and preserves first-minimum tie-breaking.  n == 0 returns above.
   return std::begin(r) + internal::reduce(make_slice(SS), make_monoid(f, (size_t)0));
 }
 
