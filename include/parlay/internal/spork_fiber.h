@@ -11,14 +11,15 @@
 // half of that: context switching and a pool of lazily committed stacks.  The
 // protocol that uses them is in spork_scheduler.h.
 //
-// Switching is Boost.Context's fcontext.  A jump pushes the callee-saved
-// registers onto the stack being left and hands back a one-shot handle to it,
+// Switching is Boost.Context's fcontext, vendored in fcontext.h.  A jump
+// pushes the callee-saved registers onto the stack being left and hands back
+// a one-shot handle to it,
 // so a handle only comes into existence once its stack has been vacated; the
 // protocol relies on that, because a parent must be off its stack before it
 // tells the thief the stack is available.  fcontext also preserves the MXCSR
 // and x87 control words, which are callee-saved under the System V ABI.
 
-#include <boost/context/detail/fcontext.hpp>
+#include "fcontext.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,11 +30,6 @@
 #include <unistd.h>
 
 namespace spork {
-
-using fcontext_t = boost::context::detail::fcontext_t;
-using transfer_t = boost::context::detail::transfer_t;
-using boost::context::detail::make_fcontext;
-using boost::context::detail::jump_fcontext;
 
 // Why a suspended continuation is being resumed, passed as the jump's data
 // word.  A continuation resumed by a thief keeps this thread's home handle,
