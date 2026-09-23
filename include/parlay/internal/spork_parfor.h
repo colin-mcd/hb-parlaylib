@@ -137,47 +137,11 @@ namespace { // private
 template <typename idx, typename BodyLambda, typename BinOp>
 void parfor(idx i, idx j, parlay::monoid_value_type_t<BinOp>& a, const BodyLambda&& body, const BinOp&& binop) {
   using A = parlay::monoid_value_type_t<BinOp>;
-  if constexpr (sizeof(sig_atomic_t) < sizeof(idx)) {
-    if (i >= j) return;
-
-    static_assert(sizeof(sig_atomic_t) >= sizeof(uint32_t));
-
-    if (std::is_signed_v<idx> &&
-        i >= SIG_ATOMIC_MIN &&
-        j <= SIG_ATOMIC_MAX) {
-      parfor_(static_cast<sig_atomic_t>(i), static_cast<sig_atomic_t>(j), a,
-              [body = fwd(body)] (sig_atomic_t k, A& a) {
-                return body(static_cast<idx>(k), a);
-              }, fwd(binop));
-    } else if (std::is_unsigned_v<idx> &&
-               sizeof(sig_atomic_t) <= sizeof(uint32_t) &&
-               j <= 0xFFFFFFFFU) {
-        parfor_(static_cast<uint32_t>(i), static_cast<uint32_t>(j), a,
-                [body = fwd(body)] (uint32_t k, A& a) {
-                  return body(static_cast<idx>(k), a);
-                }, fwd(binop));
-    } else if ((j - i) <= 0xFFFFFFFFU) {
-      parfor_((uint32_t) 0, static_cast<uint32_t>(j - i), a,
-              [i, body = fwd(body)] (uint32_t k, A& a) {
-                return body(i + static_cast<idx>(k), a);
-              }, fwd(binop));
-    } else {
-      idx n = j - i;
-      idx num_blocks = 1 + ((j - i - 1) >> 30);
-      const std::function<void(idx, A&)> fn = [j, i, &body, &binop] (idx block, A& a) {
-        idx offset = block << 30;
-        uint32_t block_end = (block == 1 + ((j - i - 1) >> 30)) ?
-          ((block + 1) << 30) : (j - i - offset);
-        parfor_((uint32_t) 0, block_end, a,
-                [base = i + offset, &body] (uint32_t k, A& a) {
-                  fwd(body)(base + static_cast<idx>(k), a);
-                }, fwd(binop));
-      };
-      parfor((idx) 0, num_blocks, a, fwd(fn), fwd(binop));
-    }
-  } else {
-    parfor_(i, j, a, fwd(body), fwd(binop));
-  }
+  parfor_(static_cast<sig_atomic_t>(i), static_cast<sig_atomic_t>(j), a,
+          [body = fwd(body)] (sig_atomic_t i, A& a) {
+            return body(static_cast<idx>(i), a);
+          },
+          fwd(binop));
 }
 
 template <typename idx, typename BodyLambda, typename BinOp>
@@ -200,6 +164,81 @@ void parfor(idx n, const BodyLambda&& body) {
 template <typename idx, typename BodyLambda, typename BinOp>
 parlay::monoid_value_type_t<BinOp> parfor(idx n, const BodyLambda&& body, const BinOp&& binop) {
   return parfor((idx) 0, n, fwd(body), fwd(binop));
+}
+
+template <typename idx, typename BodyLambda, typename BinOp>
+void parfor_wide(idx i, idx j, parlay::monoid_value_type_t<BinOp>& a, const BodyLambda&& body, const BinOp&& binop) {
+  static_assert(sizeof(sig_atomic_t) >= sizeof(idx) ||
+                sizeof(sig_atomic_t) >= sizeof(uint32_t));
+  using A = parlay::monoid_value_type_t<BinOp>;
+
+  if constexpr (sizeof(sig_atomic_t) >= sizeof(idx)) {
+    parfor_(i, j, a, fwd(body), fwd(binop));
+    return;
+  }
+
+  if (i >= j) return;
+
+  if constexpr (std::is_signed_v<idx>) {
+    if (i >= SIG_ATOMIC_MIN && j <= SIG_ATOMIC_MAX) {
+      parfor_(static_cast<sig_atomic_t>(i), static_cast<sig_atomic_t>(j), a,
+              [body = fwd(body)] (sig_atomic_t k, A& a) {
+                return body(static_cast<idx>(k), a);
+              }, fwd(binop));
+      return;
+    }
+  }
+  if constexpr (std::is_unsigned_v<idx> && sizeof(sig_atomic_t) <= sizeof(uint32_t)) {
+    if (j <= 0xFFFFFFFFU) {
+      parfor_(static_cast<uint32_t>(i), static_cast<uint32_t>(j), a,
+              [body = fwd(body)] (uint32_t k, A& a) {
+                return body(static_cast<idx>(k), a);
+              }, fwd(binop));
+      return;
+    }
+  }
+  if ((j - i) <= 0xFFFFFFFFU) {
+    parfor_((uint32_t) 0, static_cast<uint32_t>(j - i), a,
+            [i, body = fwd(body)] (uint32_t k, A& a) {
+              return body(i + static_cast<idx>(k), a);
+            }, fwd(binop));
+    return;
+  }
+  idx n = j - i;
+  idx num_blocks = 1 + ((j - i - 1) >> 30);
+  const std::function<void(idx, A&)> fn = [j, i, &body, &binop] (idx block, A& a) {
+    idx offset = block << 30;
+    uint32_t block_end = (block == 1 + ((j - i - 1) >> 30)) ?
+      ((block + 1) << 30) : (j - i - offset);
+    parfor_((uint32_t) 0, block_end, a,
+            [base = i + offset, &body] (uint32_t k, A& a) {
+              fwd(body)(base + static_cast<idx>(k), a);
+            }, fwd(binop));
+  };
+  parfor_wide((idx) 0, num_blocks, a, fwd(fn), fwd(binop));
+  return;
+}
+
+template <typename idx, typename BodyLambda, typename BinOp>
+parlay::monoid_value_type_t<BinOp> parfor_wide(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
+  parlay::monoid_value_type_t<BinOp> a = fwd(binop).identity;
+  parfor_wide(i, j, a, fwd(body), fwd(binop));
+  return a;
+}
+
+template <typename idx, typename BodyLambda>
+void parfor_wide(idx i, idx j, const BodyLambda&& body) {
+  char _ = parfor_wide(i, j, [body = fwd(body)] (idx i, char _) {body(i);}, parlay::plus<char>());
+}
+
+template <typename idx, typename BodyLambda>
+void parfor_wide(idx n, const BodyLambda&& body) {
+  parfor_wide((idx) 0, n, fwd(body));
+}
+
+template <typename idx, typename BodyLambda, typename BinOp>
+parlay::monoid_value_type_t<BinOp> parfor_wide(idx n, const BodyLambda&& body, const BinOp&& binop) {
+  return parfor_wide((idx) 0, n, fwd(body), fwd(binop));
 }
 
 } // namespace spork
