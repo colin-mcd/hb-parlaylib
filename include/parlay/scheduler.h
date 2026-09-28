@@ -35,6 +35,11 @@
 
 
 namespace spork {
+  // A job's `thief` before any worker has started running it.
+  inline constexpr unsigned int NO_THIEF = ~0u;
+  // Pinned-join policy tunables, defined in internal/spork_scheduler.h.
+  inline unsigned int join_thief_tries() noexcept;
+  inline unsigned int join_thief_delay_ns() noexcept;
   struct WorkStealingJob;
   void run_job(WorkStealingJob* job);   // runs a job on a fiber (internal/spork_scheduler.h)
   void init_heartbeat_stats();
@@ -175,6 +180,23 @@ struct scheduler {
     }
   }
 
+  // Wait for `awaited`, which another worker is running, helping with other
+  // work in the meantime.  Only a pinned stack waits like this; a join on a
+  // fiber hands its continuation off instead.  Every search for work tries
+  // the deque of the worker that took `awaited` first, a bounded number of
+  // times: its promoted descendants are found there, so running them shortens
+  // the wait rather than lengthening it.  Only then does it steal at random.
+  void wait_for_job(const Job* awaited) {
+    auto done = [&]() { return awaited->finished(); };
+    while (true) {
+      if (done()) return;
+      Job* job = get_own_job();
+      if (!job) job = steal_job_patient(done, awaited);
+      if (!job) return;
+      spork::run_job(job);
+    }
+  }
+
   // Pop from local stack.
   Job* get_own_job() {
     auto id = worker_id();
@@ -279,6 +301,42 @@ struct scheduler {
       std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
     } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
     return nullptr;
+  }
+
+  // Up to join_thief_tries() attempts on the deque of the worker running
+  // `awaited`, pausing join_thief_delay_ns() between them, then random steals
+  // with no timeout.  Returns nullptr as soon as break_early() holds.
+  template<typename F>
+  Job* steal_job_patient(F&& break_early, const Job* awaited) {
+    const size_t id = worker_id();
+    const unsigned int tries = spork::join_thief_tries();
+    const auto delay = std::chrono::nanoseconds(spork::join_thief_delay_ns());
+    for (unsigned int k = 0; k < tries; k++) {
+      if (break_early()) return nullptr;
+      const unsigned int t = awaited->thief;
+      if (t != spork::NO_THIEF && t < static_cast<unsigned int>(num_deques) && t != id) {
+        auto [job, empty] = deques[t].pop_top();
+#if PARLAY_ELASTIC_PARALLELISM
+        if (!empty) wake_up_a_worker();
+#endif
+        if (job) return job;
+      }
+      if (k + 1 < tries) pause_for(delay, break_early);
+    }
+    return steal_job(std::forward<F>(break_early), false);
+  }
+
+  // Spin for `d`, or until stop() holds, so the pause between attempts never
+  // delays a join whose child has just finished.
+  template<typename F>
+  static void pause_for(std::chrono::nanoseconds d, F& stop) {
+    if (d.count() <= 0) return;
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (!stop() && std::chrono::steady_clock::now() < until) {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#endif
+    }
   }
 
   Job* try_steal(size_t id) {

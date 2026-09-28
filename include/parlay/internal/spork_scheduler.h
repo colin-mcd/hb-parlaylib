@@ -5,6 +5,7 @@
 #include "spork_fiber.h"
 #include "../monoid.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <csignal>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <type_traits>
@@ -46,6 +48,32 @@ namespace spork {
   // the continuation's pool, so tokens are never lost on a thief.
   // SPORK_JOIN_COLLECT=0 disables.
   inline bool JOIN_COLLECT_TOKENS = true;
+
+  // ---- patient stealing from the child at a pinned join ---------------------
+  // A join on a pinned stack (the main thread's) cannot hand its continuation
+  // to the thief, so the parent waits, helping with other work meanwhile.  A
+  // job stolen at random can outlast the child and delay everything after the
+  // join, so each search for work first tries the deque of the worker running
+  // the child, JOIN_THIEF_TRIES times, JOIN_THIEF_DELAY_NS apart: the child's
+  // own promoted work is found there, and running it cannot delay the join.
+  // As in hb3-parlaylib.  20 tries measured the same as 250 and as none
+  // (BFS on the 3D grid perhaps 4% faster, within noise).
+  // SPORK_JOIN_THIEF_TRIES and SPORK_JOIN_THIEF_DELAY_NS override, and
+  // SPORK_JOIN_THIEF_TRIES=0 steals at random at once.
+  inline unsigned int JOIN_THIEF_TRIES = 20;
+  inline unsigned int JOIN_THIEF_DELAY_NS = 1000;
+  inline unsigned int join_thief_tries() noexcept { return JOIN_THIEF_TRIES; }
+  inline unsigned int join_thief_delay_ns() noexcept { return JOIN_THIEF_DELAY_NS; }
+
+  // ---- refund at stolen joins -----------------------------------------------
+  // A promotion costs a token.  When its job is actually stolen, the thread
+  // that resumes the continuation after the join gets STEAL_REFUND tokens
+  // back; a job that nobody stole refunds nothing.  So parallelism that was
+  // used pays for itself, and a region whose loops were helped with ends
+  // with tokens for the next one.  The joined slot was promoted, so every
+  // older open slot is too, and holding tokens stays consistent with that.
+  // SPORK_STEAL_REFUND sets the amount; 0 disables.
+  inline unsigned int STEAL_REFUND = 1;
 
   // ---- stack handoff, thread state ---------------------------------------
   struct Fiber;
@@ -102,6 +130,7 @@ struct WorkStealingJob {
     // beat can be lost in the window.
     const unsigned int enclosing = heartbeat_tokens;
     heartbeat_tokens = hbt;
+    thief = worker_id();   // lets a parent waiting at a pinned join steal from where the child is
     start_heartbeats();
     run();
     pause_heartbeats();
@@ -119,14 +148,14 @@ struct WorkStealingJob {
 
   void wait() const noexcept {
     pause_heartbeats();
-    auto done = [&] () { return finished(); };
-    get_current_scheduler().wait_until(done);
+    get_current_scheduler().wait_for_job(this);
     start_heartbeats();
   }
 
   void enqueue(unsigned int with_tokens = 0) {
     handoff = handoff_possible();
     if (handoff) join_count.store(2, std::memory_order_relaxed);
+    thief = NO_THIEF;
     hbt = with_tokens;
     if (with_tokens) heartbeat_tokens = heartbeat_tokens - with_tokens;
     get_current_scheduler().spawn(this);
@@ -156,6 +185,7 @@ struct WorkStealingJob {
   volatile std::atomic_flag done;
   volatile unsigned int hbt; // heartbeat tokens
   volatile unsigned int leftover = 0; // tokens this job had left when it finished
+  volatile unsigned int thief;        // worker running this job, once one has started it
 
   // ---- stack handoff -----------------------------------------------------
   // Set when this job is enqueued from a stack that can be suspended (that
@@ -310,10 +340,47 @@ struct WorkStealingJob {
 
   [[noreturn]] void fiber_body(Fiber* f);
 
+  // Free fibers.  Each thread caches up to FIBER_CACHE_MAX of them.  A thread
+  // whose cache overflows moves FIBER_BATCH to a shared pool, and one whose
+  // cache is empty takes up to FIBER_BATCH back before it maps a new stack.
+  // A fiber is freed on whichever thread ends up leaving it, not the one that
+  // acquired it, so with purely per-thread lists some threads hoard stacks
+  // while others keep mapping new ones: three rounds of gbbs BFS on the 3D
+  // grid mapped 52,000 stacks for a peak of 187 live.  The pool's lock is
+  // taken only to move a batch, and never from the heartbeat handler.
+  //
+  // Both functions are noinline so that the thread-local lists are addressed
+  // afresh on every call: they run after context switches, which can resume a
+  // computation on a different thread.
+  inline constexpr unsigned int FIBER_CACHE_MAX = 16;
+  inline constexpr unsigned int FIBER_BATCH = FIBER_CACHE_MAX / 2;
   inline constinit thread_local Fiber* fiber_free_list = nullptr;
+  inline constinit thread_local unsigned int fiber_free_count = 0;
 
-  inline Fiber* fiber_acquire() {
-    if (Fiber* f = fiber_free_list) { fiber_free_list = f->next_free; return f; }
+  struct FiberPool {
+    std::mutex lock;
+    Fiber* head = nullptr;
+  };
+  inline FiberPool fiber_pool;
+
+  [[gnu::noinline]] inline Fiber* fiber_acquire() {
+    if (fiber_free_list == nullptr) {
+      std::lock_guard<std::mutex> g(fiber_pool.lock);
+      if (Fiber* h = fiber_pool.head) {
+        Fiber* t = h;
+        unsigned int n = 1;
+        while (n < FIBER_BATCH && t->next_free != nullptr) { t = t->next_free; n++; }
+        fiber_pool.head = t->next_free;
+        t->next_free = nullptr;
+        fiber_free_list = h;
+        fiber_free_count = n;
+      }
+    }
+    if (Fiber* f = fiber_free_list) {
+      fiber_free_list = f->next_free;
+      fiber_free_count--;
+      return f;
+    }
     void* base = fiber_map_stack();
     auto top = reinterpret_cast<std::uintptr_t>(base) + FIBER_STACK_SIZE - sizeof(Fiber);
     // default-initialised: SporkSlot's default constructor is explicit
@@ -324,9 +391,19 @@ struct WorkStealingJob {
     return f;
   }
 
-  inline void fiber_release(Fiber* f) noexcept {
+  [[gnu::noinline]] inline void fiber_release(Fiber* f) noexcept {
     f->next_free = fiber_free_list;
     fiber_free_list = f;
+    if (++fiber_free_count > FIBER_CACHE_MAX) {
+      Fiber* h = fiber_free_list;
+      Fiber* t = h;
+      for (unsigned int i = 1; i < FIBER_BATCH; i++) t = t->next_free;
+      fiber_free_list = t->next_free;
+      fiber_free_count -= FIBER_BATCH;
+      std::lock_guard<std::mutex> g(fiber_pool.lock);
+      t->next_free = fiber_pool.head;
+      fiber_pool.head = h;
+    }
   }
 
   void fiber_trampoline(transfer_t t);
@@ -383,6 +460,7 @@ struct WorkStealingJob {
     fiber_drain();
     start_heartbeats();
 
+    job->thief = WorkStealingJob::worker_id();
     job->run();
 
     if (JOIN_COLLECT_TOKENS) job->leftover = heartbeat_tokens;
@@ -452,6 +530,7 @@ struct WorkStealingJob {
     if (!handoff) {                   // parent's stack is pinned: wait for the child
       if (!finished()) wait();
       if (JOIN_COLLECT_TOKENS) heartbeat_tokens = heartbeat_tokens + leftover;
+      heartbeat_tokens = heartbeat_tokens + STEAL_REFUND;
       return;
     }
     if (join_count.load(std::memory_order_acquire) != 1) {
@@ -475,6 +554,7 @@ struct WorkStealingJob {
     // Otherwise the thief had already finished, so we are trivially second
     // and never left this stack.
     if (JOIN_COLLECT_TOKENS) heartbeat_tokens = heartbeat_tokens + leftover;
+    heartbeat_tokens = heartbeat_tokens + STEAL_REFUND;
   }
 
   template <typename PromLambda>
@@ -504,6 +584,9 @@ struct WorkStealingJob {
 
   inline void init_heartbeat_stats() {
     if (const char* e = std::getenv("SPORK_JOIN_COLLECT")) JOIN_COLLECT_TOKENS = std::atoi(e) != 0;
+    if (const char* e = std::getenv("SPORK_STEAL_REFUND")) STEAL_REFUND = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_THIEF_TRIES")) JOIN_THIEF_TRIES = std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("SPORK_JOIN_THIEF_DELAY_NS")) JOIN_THIEF_DELAY_NS = std::max(0, std::atoi(e));
 #ifdef RECORD_HEARTBEAT_STATS
     static bool initialized = false;
     if (!initialized) {
