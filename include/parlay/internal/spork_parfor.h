@@ -12,8 +12,11 @@
 #include <limits.h>
 #include <type_traits>
 
-#define VOLATILE_UNROLL
-
+// VOLATILE_UNROLL is set on the command line (-DVOLATILE_UNROLL=) together
+// with the Spork unroll plugin (-fpass-plugin=.../SporkUnroll.so), which
+// replaces the two calls below: it strip-mines the promotable loop so the
+// per-iteration volatile bound and progress store are paid once per block.
+// Without it the library is header-only and each iteration pays them.
 #ifdef VOLATILE_UNROLL
 extern "C" void __spork_unroll_loop(const void* site) noexcept;
 extern "C" unsigned int __spork_get_unroll_factor(const void* site) noexcept;
@@ -115,20 +118,20 @@ namespace { // private
 
         r.i = mid;
         r.j = j;
-        r.enqueue((heartbeat_tokens + 1) >> 1);
+        r.enqueue();
 
         if (prom_i >= mid) { l.i = 0; l.j = 0; return; }
         l.i = prom_i;
         l.j = mid;
-        l.enqueue(heartbeat_tokens);
+        l.enqueue();
       });
     if (promoted) [[unlikely]] {
       if (l.i < l.j) [[likely]] {
-        l.sync(true);
+        l.sync();
         a = fwd(binop)(a, l.a);
       }
       if (r.i < r.j) [[likely]] {
-        r.sync(true); // was false
+        r.sync();
         a = fwd(binop)(a, r.a);
       }
     }

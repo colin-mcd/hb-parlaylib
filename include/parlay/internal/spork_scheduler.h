@@ -34,20 +34,23 @@ namespace parlay {
 
 namespace spork {
 
-  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 64;
+  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 32;
   inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 250;
-  // inline constexpr unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT * 100000;
+  // The tokens the running job may spend on promotions.  A job starts with
+  // TOKENS_PER_HEARTBEAT; a parent hands none to the jobs it spawns, nor takes
+  // back what they have left when they finish; and the balance never exceeds
+  // TOKENS_PER_HEARTBEAT: every addition goes through add_heartbeat_tokens.
   inline constinit thread_local volatile unsigned int heartbeat_tokens = 0;
+  [[gnu::always_inline]] inline void add_heartbeat_tokens(unsigned int n) noexcept {
+    const unsigned int t = heartbeat_tokens + n;
+    heartbeat_tokens = t < TOKENS_PER_HEARTBEAT ? t : TOKENS_PER_HEARTBEAT;
+  }
   // true => this *job* must not be promoted; used during eager promotions to prevent signal-delivered heartbeats from promoting simultaneously
   inline constinit thread_local volatile bool disable_heartbeats = false;
   // true => this *processor* (= thread) is between jobs; not fiber state
   inline constinit thread_local volatile bool heartbeats_idle = true;
   // true => the *scheduler* is done, e.g., at end of program
   inline constinit std::atomic<bool> heartbeats_done = false;
-  // At a join, add the tokens a stolen child had left when it finished to
-  // the continuation's pool, so tokens are never lost on a thief.
-  // SPORK_JOIN_COLLECT=0 disables.
-  inline bool JOIN_COLLECT_TOKENS = true;
 
   // ---- patient stealing from the child at a pinned join ---------------------
   // A join on a pinned stack (the main thread's) cannot hand its continuation
@@ -124,20 +127,17 @@ struct WorkStealingJob {
   void operator()() {
     // This job may run nested inside a join's wait(), on a thread that already
     // holds tokens belonging to the frame that is waiting.  Run on this job's
-    // own budget and put the enclosing frame's back on the way out, so a job
-    // never spends, nor carries off to its own join, tokens that belong to
-    // another computation.  Both boundaries run with heartbeats paused, so no
-    // beat can be lost in the window.
+    // own budget, a full TOKENS_PER_HEARTBEAT, and put the enclosing frame's
+    // back on the way out, so a job never spends, nor carries off to its own
+    // join, tokens that belong to another computation.  Both boundaries run
+    // with heartbeats paused, so no beat can be lost in the window.
     const unsigned int enclosing = heartbeat_tokens;
-    heartbeat_tokens = hbt;
+    heartbeat_tokens = TOKENS_PER_HEARTBEAT;
     thief = worker_id();   // lets a parent waiting at a pinned join steal from where the child is
     start_heartbeats();
     run();
     pause_heartbeats();
-    if (JOIN_COLLECT_TOKENS) {   // hand the unspent budget to the joining parent
-      leftover = heartbeat_tokens;
-    }                            // otherwise it is dropped here (the A/B case)
-    heartbeat_tokens = enclosing;
+    heartbeat_tokens = enclosing;   // whatever this job had left is dropped
     bool was_done = done.test_and_set(std::memory_order_release);
     assert(!was_done);
   }
@@ -152,12 +152,10 @@ struct WorkStealingJob {
     start_heartbeats();
   }
 
-  void enqueue(unsigned int with_tokens = 0) {
+  void enqueue() {
     handoff = handoff_possible();
     if (handoff) join_count.store(2, std::memory_order_relaxed);
     thief = NO_THIEF;
-    hbt = with_tokens;
-    if (with_tokens) heartbeat_tokens = heartbeat_tokens - with_tokens;
     get_current_scheduler().spawn(this);
   }
 
@@ -165,13 +163,12 @@ struct WorkStealingJob {
     return get_current_scheduler().get_own_job() != nullptr;
   }
 
-  void fast_clone(bool reclaim_tokens) {
-    if (reclaim_tokens) heartbeat_tokens = heartbeat_tokens + hbt;
+  void fast_clone() {
     const_cast<WorkStealingJob*>(this)->run();
   }
 
   // Defined below, once fibers are available.
-  void sync(bool reclaim_tokens);
+  void sync();
 
   bool sync_is_stolen() {
     if (!try_dequeue()) {
@@ -183,8 +180,6 @@ struct WorkStealingJob {
 
   virtual void run() = 0;
   volatile std::atomic_flag done;
-  volatile unsigned int hbt; // heartbeat tokens
-  volatile unsigned int leftover = 0; // tokens this job had left when it finished
   volatile unsigned int thief;        // worker running this job, once one has started it
 
   // ---- stack handoff -----------------------------------------------------
@@ -453,7 +448,7 @@ struct WorkStealingJob {
     f->deque_front.promoted = true;
     f->deque_front.next.store(nullptr);
     f->saved_back = &f->deque_front.next;
-    f->saved_tokens = job->hbt;
+    f->saved_tokens = TOKENS_PER_HEARTBEAT;
     f->saved_disable = false;
     fiber_install(f);
     fiber_switching = false;
@@ -463,7 +458,6 @@ struct WorkStealingJob {
     job->thief = WorkStealingJob::worker_id();
     job->run();
 
-    if (JOIN_COLLECT_TOKENS) job->leftover = heartbeat_tokens;
     fiber_switching = true;
     if (job->handoff) {
       if (job->join_count.fetch_sub(1, std::memory_order_acq_rel) != 2) {
@@ -522,15 +516,15 @@ struct WorkStealingJob {
     fiber_switching = false;
   }
 
-  inline void WorkStealingJob::sync(bool reclaim_tokens) {
+  inline void WorkStealingJob::sync() {
     if (try_dequeue()) {              // never stolen: run it here, on our budget
-      fast_clone(reclaim_tokens);
+      fast_clone();
       return;
     }
     if (!handoff) {                   // parent's stack is pinned: wait for the child
       if (!finished()) wait();
-      if (JOIN_COLLECT_TOKENS) heartbeat_tokens = heartbeat_tokens + leftover;
-      heartbeat_tokens = heartbeat_tokens + STEAL_REFUND;
+      add_heartbeat_tokens(STEAL_REFUND);
+      //add_heartbeat_tokens(TOKENS_PER_HEARTBEAT);
       return;
     }
     if (join_count.load(std::memory_order_acquire) != 1) {
@@ -553,8 +547,7 @@ struct WorkStealingJob {
     }
     // Otherwise the thief had already finished, so we are trivially second
     // and never left this stack.
-    if (JOIN_COLLECT_TOKENS) heartbeat_tokens = heartbeat_tokens + leftover;
-    heartbeat_tokens = heartbeat_tokens + STEAL_REFUND;
+    add_heartbeat_tokens(STEAL_REFUND);
   }
 
   template <typename PromLambda>
@@ -583,7 +576,6 @@ struct WorkStealingJob {
   inline volatile unsigned int* missed_heartbeats = nullptr;
 
   inline void init_heartbeat_stats() {
-    if (const char* e = std::getenv("SPORK_JOIN_COLLECT")) JOIN_COLLECT_TOKENS = std::atoi(e) != 0;
     if (const char* e = std::getenv("SPORK_STEAL_REFUND")) STEAL_REFUND = std::max(0, std::atoi(e));
     if (const char* e = std::getenv("SPORK_JOIN_THIEF_TRIES")) JOIN_THIEF_TRIES = std::max(0, std::atoi(e));
     if (const char* e = std::getenv("SPORK_JOIN_THIEF_DELAY_NS")) JOIN_THIEF_DELAY_NS = std::max(0, std::atoi(e));
@@ -625,10 +617,7 @@ struct WorkStealingJob {
       volatile unsigned int& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
       hbs = hbs + 1;
 #endif
-      heartbeat_tokens = heartbeat_tokens + TOKENS_PER_HEARTBEAT;
-      // if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
-      //   heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
-      // }
+      add_heartbeat_tokens(TOKENS_PER_HEARTBEAT);
       SporkSlot::promote_front();
     } else {
 #ifdef RECORD_HEARTBEAT_STATS
