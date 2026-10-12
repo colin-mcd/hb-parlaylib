@@ -17,6 +17,7 @@
 
 #include "internal/work_stealing_deque.h"         // IWYU pragma: keep
 #include "internal/work_stealing_job.h"
+#include "internal/fiber.h"
 
 // IWYU pragma: no_include <bits/chrono.h>
 // IWYU pragma: no_include <bits/this_thread_sleep.h>
@@ -198,7 +199,7 @@ struct scheduler {
 #endif
     while (!finished()) {
       Job* job = get_job([&]() { return finished(); }, PARLAY_ELASTIC_PARALLELISM);
-      if (job)(*job)();
+      if (job) run_job(job);
 #if PARLAY_ELASTIC_PARALLELISM
       else if (!finished()) {
         // If no job was stolen, the worker should go to
@@ -223,7 +224,7 @@ struct scheduler {
     while (true) {
       Job* job = get_job(done, false);  // timeout MUST BE false
       if (!job) return;
-      (*job)();
+      run_job(job);
     }
     assert(done());
   }
@@ -338,11 +339,18 @@ class fork_join_scheduler {
   static void pardo(scheduler_t& scheduler, L&& left, R&& right, bool conservative = false) {
     auto execute_right = [&]() { std::forward<R>(right)(); };
     auto right_job = make_job(right);
+    // A conservative join must not wander off to unrelated work, so it keeps
+    // the blocking discipline even on a fiber.
+    right_job.handoff = (current_fiber != nullptr) && !conservative;
+    if (right_job.handoff) right_job.join_count.store(2, std::memory_order_relaxed);
     scheduler.spawn(&right_job);
     std::forward<L>(left)();
     if (const Job* job = scheduler.get_own_job(); job != nullptr) {
       assert(job == &right_job);
-      execute_right();
+      execute_right();          // never stolen: run it here
+    }
+    else if (right_job.handoff) {
+      join_stolen(&right_job);  // give up this stack; the second arriver continues
     }
     else {
       auto done = [&]() { return right_job.finished(); };
