@@ -216,21 +216,28 @@ auto group_by_small_int(slice<InIterator, InIterator> In,
 
   if (num_buckets == 2) {
     sequence<size_t> Sums(num_blocks);
+    // Each block copies what its loop reads into locals: a local cannot be
+    // clobbered by the loop's stores, so it is not reloaded every iteration.
     sliced_for(n, block_size, [&](size_t i, size_t s, size_t e) {
+	auto keys = Keys;
 	size_t c = 0;
-	for (size_t j = s; j < e; j++) c += (Keys[j] == 0);
+	for (size_t j = s; j < e; j++) c += (keys[j] == 0);
 	Sums[i] = c; });
     size_t m = scan_inplace(make_slice(Sums), plus<size_t>());
     auto r0 = sequence<T>::uninitialized(m);
     auto r1 = sequence<T>::uninitialized(n-m);
     sliced_for(n, block_size, [&](size_t i, size_t s, size_t e) {
+	auto keys = Keys;
+	auto in = In;
+	auto out0 = r0.begin();
+	auto out1 = r1.begin();
 	size_t c0 = Sums[i];
 	size_t c1 = s - c0;
 	for (size_t j = s; j < e; j++) {
-	  if (Keys[j] == 0)
-	    assign_uninitialized(r0[c0++], In[j]);
+	  if (keys[j] == 0)
+	    assign_uninitialized(out0[c0++], in[j]);
 	  else
-	    assign_uninitialized(r1[c1++], In[j]);
+	    assign_uninitialized(out1[c1++], in[j]);
 	}});
     return parlay::sequence<sequence<T>>{std::move(r0), std::move(r1)};
   }

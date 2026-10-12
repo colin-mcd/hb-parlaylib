@@ -20,6 +20,7 @@
 #include "portability.h"
 #include "type_traits.h"
 
+#include "internal/capped_copy.h"          // IWYU pragma: export
 #include "internal/debug_uninitialized.h"
 
 // IWYU pragma: no_include <tuple>

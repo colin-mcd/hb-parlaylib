@@ -12,6 +12,10 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <ctime>
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#endif
 #include <iostream>
 #include <mutex>
 #include <new>
@@ -22,7 +26,6 @@
 
 #define USE_SIGNAL_SAFE_ATOMIC
 #define RECORD_HEARTBEAT_STATS
-#define fwd(x) std::forward<std::remove_reference_t<decltype(x)>>(x)
 
 namespace parlay {
   template <typename Job>
@@ -34,16 +37,141 @@ namespace parlay {
 
 namespace spork {
 
-  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = 32;
+  // simulated heartbeat interval is HEARTBEAT_INTERVAL_US/HEARTBEAT_COARSENING_FACTOR,
+  // but with exponential work overhead as HEARTBEAT_COARSENING_FACTOR increases
   inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 250;
-  // The tokens the running job may spend on promotions.  A job starts with
-  // TOKENS_PER_HEARTBEAT; a parent hands none to the jobs it spawns, nor takes
-  // back what they have left when they finish; and the balance never exceeds
-  // TOKENS_PER_HEARTBEAT: every addition goes through add_heartbeat_tokens.
+  inline constexpr unsigned int HEARTBEAT_COARSENING_FACTOR = 6;
+  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = (1 << HEARTBEAT_COARSENING_FACTOR) - 1;
+  // The tokens the running computation may spend on promotions, never more
+  // than TOKEN_LIMIT (below), and when it last converted its time into
+  // tokens (task_mark, below):
+  //  - a heartbeat converts the time since the mark into whole tokens, pro
+  //    rata (a whole interval is a whole TOKENS_PER_HEARTBEAT), see settle:
+  //    below the cap the remainder, under one token's worth, stays on the
+  //    clock, and at the cap it is dropped;
+  //  - a promotion costs one token, and of the t that remain the left side
+  //    (the computation that keeps running here) keeps ceil(t/2) and its mark,
+  //    and the right side (the spawned job) gets floor(t/2), see split_tokens;
+  //  - the right side starts, stolen or not, with the tokens it was given and
+  //    its mark at the moment it starts;
+  //  - at every join, stolen or not, the continuation's tokens and mark come
+  //    from both sides' balances and elapsed time pooled, converted the same
+  //    way (settle again), see join_tokens.
   inline constinit thread_local volatile unsigned int heartbeat_tokens = 0;
-  [[gnu::always_inline]] inline void add_heartbeat_tokens(unsigned int n) noexcept {
-    const unsigned int t = heartbeat_tokens + n;
-    heartbeat_tokens = t < TOKENS_PER_HEARTBEAT ? t : TOKENS_PER_HEARTBEAT;
+  // The cap on a balance.  Beats and joins are the only steps that create
+  // tokens; both clamp the balance to it and drop the rest of the credit
+  // (see settle).  By default it is TOKENS_PER_HEARTBEAT.  With
+  // SPORK_UNCAPPED_TOKENS there is in effect no cap: a beat adds every whole
+  // token its clock is worth and a join gives every whole token the pooled
+  // credit is worth, the remainder (under a token's worth) staying on the
+  // clock either way.  Balances are then still held below 2^30 so that they
+  // cannot overflow, which a computation would reach only after about an
+  // hour of sequential running at 63 tokens per 250 us.
+#ifdef SPORK_UNCAPPED_TOKENS
+  inline constexpr unsigned int TOKEN_LIMIT = 1u << 30;
+#else
+  inline constexpr unsigned int TOKEN_LIMIT = TOKENS_PER_HEARTBEAT;
+#endif
+  // Called by a promotion handler once the promotion's token is paid: the
+  // running computation keeps ceil(t/2) of the t left and the returned
+  // floor(t/2) are for the job being spawned.
+  [[gnu::always_inline]] inline unsigned int split_tokens() noexcept {
+    const unsigned int t = heartbeat_tokens;
+    heartbeat_tokens = t - t / 2;
+    return t / 2;
+  }
+
+  // ---- time -----------------------------------------------------------------
+  // A task's elapsed time plays the part of the heartbeat timer in the token
+  // proofs (spork-proofs2), but the hardware timer is never re-armed: each
+  // task has a software mark instead, and its elapsed time is now - mark.
+  // A mark is set when a right side starts (to now), and at the task's beats
+  // and joins by settle (to now, less the credit not converted); with
+  // SPORK_IGNORE_HB_WORK it is also moved past the time spent promoting and
+  // joining (see IGNORE_HB_WORK).  The credit left on a clock is under one
+  // token's worth (N / B), but it may reach back past this thread's last
+  // beat: a negative base in the proofs.  So a task's elapsed time exceeds
+  // its thread's timer by less than N / B, and a beat comes by the time it
+  // reaches N + N / B (a missed beat aside): the proofs' L.
+  //
+  // The time source is clock_gettime(CLOCK_MONOTONIC): POSIX,
+  // async-signal-safe, in nanoseconds, and the clock the heartbeat timer
+  // itself runs on (19 ns a read on the Xeon 8380).  With SPORK_RDTSC defined
+  // on x86-64 it is rdtsc instead (9 ns a read there; it needs a TSC that is
+  // invariant and synchronized across cores, and a calibration).  Every join
+  // reads the time two or three times, but the two measured the same: PBBS at
+  // 80 cores 0.998 (geomean, clock_gettime / rdtsc), fib 1 core +0.1%.  The
+  // names below say tsc: with clock_gettime their unit is the nanosecond.
+#if !defined(SPORK_RDTSC) || !defined(__x86_64__)
+#define SPORK_TIME_FROM_CLOCK_GETTIME 1
+#endif
+  inline std::uint64_t monotonic_ns() noexcept {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000u + static_cast<std::uint64_t>(ts.tv_nsec);
+  }
+  [[gnu::always_inline]] inline std::uint64_t tsc_now() noexcept {
+#ifdef SPORK_TIME_FROM_CLOCK_GETTIME
+    return monotonic_ns();
+#else
+    return __rdtsc();
+#endif
+  }
+  inline constexpr std::uint64_t HEARTBEAT_INTERVAL_NS = std::uint64_t{HEARTBEAT_INTERVAL_US} * 1000u;
+  static_assert(HEARTBEAT_INTERVAL_NS < 1000000000u, "the timer is set through tv_nsec alone");
+  // The heartbeat interval in time-source units.  With rdtsc, measured once
+  // against CLOCK_MONOTONIC (5 ms) by the first thread to start heartbeats;
+  // with clock_gettime, the interval in nanoseconds.
+  inline std::uint64_t heartbeat_interval_tsc = 0;
+  inline void calibrate_tsc() noexcept {
+#ifdef SPORK_TIME_FROM_CLOCK_GETTIME
+    heartbeat_interval_tsc = HEARTBEAT_INTERVAL_NS;
+#else
+    static const std::uint64_t interval = [] {
+      const std::uint64_t n0 = monotonic_ns(), c0 = tsc_now();
+      std::uint64_t n1;
+      do { n1 = monotonic_ns(); } while (n1 - n0 < 5000000u);
+      const std::uint64_t c1 = tsc_now();
+      return (c1 - c0) * HEARTBEAT_INTERVAL_NS / (n1 - n0);
+    }();
+    heartbeat_interval_tsc = interval;
+#endif
+  }
+  // The running computation's mark: saved and restored with its tokens.  Its
+  // credit clock, now - mark, is the proofs' phase - base: the time it has
+  // run and not yet converted into tokens.
+  inline constinit thread_local volatile std::uint64_t task_mark = 0;
+  // noinline, like fiber_acquire: it is called after joins, which can resume
+  // a computation on a different thread, so the thread-local is addressed
+  // afresh on every call.
+  [[gnu::noinline]] inline std::uint64_t task_elapsed() noexcept {
+    return tsc_now() - task_mark;
+  }
+  // The same, also storing the time it read in `now`.
+  [[gnu::noinline]] inline std::uint64_t task_elapsed(std::uint64_t& now) noexcept {
+    now = tsc_now();
+    return now - task_mark;
+  }
+
+  // ---- heartbeat work and the clock -------------------------------------------
+  // By default the time a computation spends promoting and joining counts
+  // towards its clock like any other.  With SPORK_IGNORE_HB_WORK it does not,
+  // as in the proofs, where these take no time: the mark is moved past each
+  // promotion (in a beat's handler, or eager) and past each join's
+  // bookkeeping (popping or waiting for the job, joining the tokens), and a
+  // parent's clock stops when it arrives at the join.  A stolen job's clock
+  // starts just before the job runs.
+#ifdef SPORK_IGNORE_HB_WORK
+  inline constexpr bool IGNORE_HB_WORK = true;
+#else
+  inline constexpr bool IGNORE_HB_WORK = false;
+#endif
+  // The running computation's clock as of time t, read earlier with beats
+  // enabled: a beat since may have moved the mark past t, in which case the
+  // time up to t has already been converted and the clock is 0.
+  [[gnu::always_inline]] inline std::uint64_t clock_at(std::uint64_t t) noexcept {
+    const std::uint64_t mark = task_mark;
+    return t > mark ? t - mark : 0;
   }
   // true => this *job* must not be promoted; used during eager promotions to prevent signal-delivered heartbeats from promoting simultaneously
   inline constinit thread_local volatile bool disable_heartbeats = false;
@@ -51,6 +179,88 @@ namespace spork {
   inline constinit thread_local volatile bool heartbeats_idle = true;
   // true => the *scheduler* is done, e.g., at end of program
   inline constinit std::atomic<bool> heartbeats_done = false;
+
+  // ---- converting credit into tokens ------------------------------------------
+  // Beats and joins convert credit the same way, by settle, the scheme
+  // spork-proofs2's HeartbeatCarry.lean proves the work and span bounds for.
+  // With B = TOKENS_PER_HEARTBEAT and N the interval, a clock c and a balance
+  // t are together worth credit B * c + N * t.  settle(K) gives the running
+  // computation s = min(TOKEN_LIMIT, floor(K / N)) tokens.  Below the cap the
+  // credit not converted, under one token's worth, stays on its clock in
+  // full, floor((K - N * s) / B) of it, even if that reaches back past this
+  // thread's last beat (a negative base); at the cap it is dropped and the
+  // clock restarts at now.  No credit is ever created.
+  //  - A beat settles the running computation's own credit,
+  //    K = B * clock + N * t, so below the cap a beat that converts nothing
+  //    leaves the mark where it was.  (HeartbeatCarry clamps the clock at N
+  //    here; under the cap that changes nothing, as a clock of N is worth a
+  //    whole TOKENS_PER_HEARTBEAT by itself.)
+  //  - A join settles both sides' credit pooled (join_tokens_disabled).
+  // The hardware timer is never touched.  Called from the beat handler, or
+  // with beats disabled, so that no beat can land between reading the credit
+  // and replacing it.
+  [[gnu::always_inline]] inline void settle(std::uint64_t K, std::uint64_t N, std::uint64_t now) noexcept {
+    const std::uint64_t s = K / N;
+    if (s < TOKEN_LIMIT) {
+      heartbeat_tokens = static_cast<unsigned int>(s);
+      task_mark = now - (K - N * s) / TOKENS_PER_HEARTBEAT;
+    } else {
+      heartbeat_tokens = TOKEN_LIMIT;
+      task_mark = now;
+    }
+  }
+
+  // Every join, stolen or not: c1, t1 are the clock and balance of the side
+  // that arrived first, c2, t2 those of the side that arrived second, which
+  // the continuation follows.  Their credit is pooled and settled:
+  //   K = B * (c1 + c2) + N * (t1 + t2)
+  // Under a token's worth (K < N) both balances are 0, so the continuation
+  // gets no tokens and keeps the two sides' clocks together, c1 + c2 (under
+  // N / B), in full.  The rule is symmetric in the two sides.  Called with
+  // beats disabled (join_tokens, join_tokens_running).
+  inline void join_tokens_disabled(std::uint64_t c1, unsigned int t1,
+                                   std::uint64_t c2, unsigned int t2, std::uint64_t now) noexcept {
+    if (heartbeat_interval_tsc == 0) [[unlikely]] calibrate_tsc();   // heartbeats not started here yet
+    const std::uint64_t N = heartbeat_interval_tsc;
+    settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (c1 + c2) + N * (std::uint64_t{t1} + t2), N, now);
+  }
+
+  // A join whose two sides' clocks and balances were recorded beforehand,
+  // at time `now` if the caller already read it (0: read it here).  A thief
+  // that arrives second and continues the parent passes the time it read
+  // for its own clock, a few hundred nanoseconds before on the same thread,
+  // with nothing else run in between; the join's own time since then counts
+  // toward the continuation's clock, as all join time does by default.
+  // noinline (both entry points): they run after joins, which can resume a
+  // computation on a different thread, so their thread-locals are addressed
+  // afresh.
+  [[gnu::noinline]] inline void join_tokens(std::uint64_t c1, unsigned int t1,
+                                            std::uint64_t c2, unsigned int t2,
+                                            std::uint64_t now = 0) noexcept {
+    const bool disabled = disable_heartbeats;
+    disable_heartbeats = true;
+    if (now == 0) now = tsc_now();
+    join_tokens_disabled(c1, t1, c2, t2, now);
+    if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (tsc_now() - now);   // the join's own time
+    disable_heartbeats = disabled;
+  }
+
+  // A join one of whose sides is the computation running on this thread: its
+  // clock and balance are read here, with beats disabled, rather than by the
+  // caller, where a beat could land between reading them and this join
+  // replacing them, and its conversion would then be counted twice or lost.
+  // Its clock runs up to now, or, given arrived (with SPORK_IGNORE_HB_WORK),
+  // up to its arrival at the join.
+  [[gnu::noinline]] inline void join_tokens_running(std::uint64_t c_other, unsigned int t_other,
+                                                    std::uint64_t arrived = 0) noexcept {
+    const bool disabled = disable_heartbeats;
+    disable_heartbeats = true;
+    const std::uint64_t now = tsc_now();
+    const std::uint64_t c = (IGNORE_HB_WORK && arrived) ? clock_at(arrived) : now - task_mark;
+    join_tokens_disabled(c_other, t_other, c, heartbeat_tokens, now);
+    if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (tsc_now() - now);   // the join's own time
+    disable_heartbeats = disabled;
+  }
 
   // ---- patient stealing from the child at a pinned join ---------------------
   // A join on a pinned stack (the main thread's) cannot hand its continuation
@@ -67,16 +277,6 @@ namespace spork {
   inline unsigned int JOIN_THIEF_DELAY_NS = 1000;
   inline unsigned int join_thief_tries() noexcept { return JOIN_THIEF_TRIES; }
   inline unsigned int join_thief_delay_ns() noexcept { return JOIN_THIEF_DELAY_NS; }
-
-  // ---- refund at stolen joins -----------------------------------------------
-  // A promotion costs a token.  When its job is actually stolen, the thread
-  // that resumes the continuation after the join gets STEAL_REFUND tokens
-  // back; a job that nobody stole refunds nothing.  So parallelism that was
-  // used pays for itself, and a region whose loops were helped with ends
-  // with tokens for the next one.  The joined slot was promoted, so every
-  // older open slot is too, and holding tokens stays consistent with that.
-  // SPORK_STEAL_REFUND sets the amount; 0 disables.
-  inline unsigned int STEAL_REFUND = 1;
 
   // ---- stack handoff, thread state ---------------------------------------
   struct Fiber;
@@ -126,18 +326,22 @@ struct WorkStealingJob {
 
   void operator()() {
     // This job may run nested inside a join's wait(), on a thread that already
-    // holds tokens belonging to the frame that is waiting.  Run on this job's
-    // own budget, a full TOKENS_PER_HEARTBEAT, and put the enclosing frame's
-    // back on the way out, so a job never spends, nor carries off to its own
-    // join, tokens that belong to another computation.  Both boundaries run
-    // with heartbeats paused, so no beat can be lost in the window.
+    // holds tokens belonging to the frame that is waiting.  Run on the tokens
+    // this job was given, leave what it has left for its join, and put the
+    // enclosing frame's back on the way out.  Both boundaries run with
+    // heartbeats paused, so no beat can be lost in the window.
     const unsigned int enclosing = heartbeat_tokens;
-    heartbeat_tokens = TOKENS_PER_HEARTBEAT;
+    const std::uint64_t enclosing_mark = task_mark;
+    heartbeat_tokens = tokens;
+    task_mark = tsc_now();
     thief = worker_id();   // lets a parent waiting at a pinned join steal from where the child is
     start_heartbeats();
     run();
     pause_heartbeats();
-    heartbeat_tokens = enclosing;   // whatever this job had left is dropped
+    tokens = heartbeat_tokens;
+    child_progress = task_elapsed();
+    heartbeat_tokens = enclosing;
+    task_mark = enclosing_mark;
     bool was_done = done.test_and_set(std::memory_order_release);
     assert(!was_done);
   }
@@ -152,19 +356,42 @@ struct WorkStealingJob {
     start_heartbeats();
   }
 
-  void enqueue() {
+  // Spawn this job with t tokens of its own (from split_tokens).  Through
+  // the deque cached for this thread; the scheduler is looked up (and made,
+  // if need be) only on a thread that has none yet.
+  void enqueue(unsigned int t) {
+    tokens = t;
     handoff = handoff_possible();
     if (handoff) join_count.store(2, std::memory_order_relaxed);
     thief = NO_THIEF;
-    get_current_scheduler().spawn(this);
+    if (!scheduler_t::spawn_here(this)) [[unlikely]] get_current_scheduler().spawn(this);
   }
 
   static bool try_dequeue() {
+    if (auto* d = scheduler_t::own_deque()) [[likely]] return d->pop_bottom() != nullptr;
     return get_current_scheduler().get_own_job() != nullptr;
   }
 
-  void fast_clone() {
+  // Run by the parent, which finds the job not stolen.  It is a join like
+  // any other: the parent (left side) has finished, with its elapsed time
+  // and balance; the job (right side) starts with a fresh mark and the
+  // tokens it was given, as a thief would start it; and once it finishes,
+  // join_tokens pools the two.
+  void fast_clone(std::uint64_t arrived) {
+    // With beats disabled, so that no beat can land between reading the
+    // parent's clock and balance and replacing them with the job's.  The
+    // parent's clock runs up to now, or with SPORK_IGNORE_HB_WORK up to its
+    // arrival at the join; the job's starts now either way.
+    const bool disabled = disable_heartbeats;
+    disable_heartbeats = true;
+    const std::uint64_t now = tsc_now();
+    const std::uint64_t e1 = IGNORE_HB_WORK ? clock_at(arrived) : now - task_mark;
+    const unsigned int t1 = heartbeat_tokens;
+    task_mark = now;
+    heartbeat_tokens = tokens;
+    disable_heartbeats = disabled;
     const_cast<WorkStealingJob*>(this)->run();
+    join_tokens_running(e1, t1);   // the job, still running here, is the second side
   }
 
   // Defined below, once fibers are available.
@@ -181,6 +408,17 @@ struct WorkStealingJob {
   virtual void run() = 0;
   volatile std::atomic_flag done;
   volatile unsigned int thief;        // worker running this job, once one has started it
+  // The tokens the job starts with, set by enqueue; once it has run, the
+  // balance it finished with, for a join at which it arrives second.
+  unsigned int tokens;
+  // Once stolen, each side's elapsed time since its mark (task_elapsed) when
+  // it arrived at the join: the thief's when the job finished, and the
+  // parent's when it left its stack at a handoff join.
+  std::uint64_t child_progress;
+  std::uint64_t parent_progress;
+  // When the thief read the time for child_progress: the join's time if the
+  // thief arrives second and continues the parent (see join_tokens).
+  std::uint64_t child_end;
 
   // ---- stack handoff -----------------------------------------------------
   // Set when this job is enqueued from a stack that can be suspended (that
@@ -199,24 +437,30 @@ struct WorkStealingJob {
 
   template <typename T>
   class async_signal_safe_pointer {
-    static_assert(std::atomic<T*>::is_always_lock_free,
+    static_assert(__atomic_always_lock_free(sizeof(T*), 0),
                   "async_signal_safe_pointer relies on being always lock free!");
     private:
-    std::atomic<T*> ptr;
+    // Accessed only atomically (relaxed, behind signal fences), but a plain
+    // pointer rather than a std::atomic, which C++20 always initializes: a
+    // spork slot's next is left unwritten (no_init) until it is needed.
+    T* ptr;
     public:
+    struct no_init_t {};
 
     inline void store(T* p) noexcept {
       std::atomic_signal_fence(std::memory_order_release);
-      ptr.store(p, std::memory_order_relaxed);
+      __atomic_store_n(&ptr, p, __ATOMIC_RELAXED);
     }
 
     inline T* load() const noexcept {
-      T* p = ptr.load(std::memory_order_relaxed);
+      T* p = __atomic_load_n(&ptr, __ATOMIC_RELAXED);
       std::atomic_signal_fence(std::memory_order_acquire);
       return p;
     }
 
     inline constexpr async_signal_safe_pointer() noexcept : ptr(nullptr) {}
+
+    inline explicit async_signal_safe_pointer(no_init_t) noexcept {}
 
     inline async_signal_safe_pointer(T* p) noexcept {
       store(p);
@@ -248,27 +492,36 @@ struct WorkStealingJob {
     }
   };
 
-  struct PromFn {
-    virtual void operator()() const = 0;
-  };
-
+  // A promotable fork: pushed onto its stack's list for the duration of the
+  // fork's left side (spork_slot), oldest first.  The fork that owns it
+  // derives from it, with whatever its promotion needs (see spork and par).
   struct SporkSlot {
     volatile bool promoted; // TODO: change this to an integer, record the stealing thread? or maybe needs to be separate
-    const PromFn* promfn;
+    // The promotion, called with this slot.  A plain function, which knows
+    // what the slot belongs to, rather than a closure object: pushing a slot
+    // writes one pointer for it.
+    void (*promfn)(SporkSlot*);
     async_signal_safe_pointer<SporkSlot>* prev;
+    // The next newer slot, if any.  Left unwritten until that slot links in:
+    // promote_front reads it only after checking spork_deque_back, which is
+    // this very field until then.
     async_signal_safe_pointer<SporkSlot> next;
 
+    // A list's sentinel (spork_deque_front, Fiber::deque_front).
     constexpr explicit SporkSlot() :
       promoted(true), promfn(nullptr), prev(nullptr), next(async_signal_safe_pointer<SporkSlot>()) {}
 
-    explicit SporkSlot(const PromFn* _promfn);
+    // Not yet on the list: its owner finishes building it, and spork_slot
+    // links it.
+    explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept :
+      promoted(false), promfn(fn), next(async_signal_safe_pointer<SporkSlot>::no_init_t{}) {}
+
+    void link() noexcept;
     static void reset();
     bool close();
     void promote();
     static void promote_front();
-
-    template <typename PromLambda>
-    void eager_promote(const PromLambda&& prom);
+    void eager_promote();
   };
 
   // Slots live in the frames of the stack that created them, so the list
@@ -280,11 +533,11 @@ struct WorkStealingJob {
   inline constinit thread_local SporkSlot* spork_deque_front_p = nullptr;
   inline constinit thread_local async_signal_safe_pointer<async_signal_safe_pointer<SporkSlot>> spork_deque_back;
 
-  inline SporkSlot::SporkSlot(const PromFn* _promfn)
-    : promoted(false), promfn(_promfn) {
+  // Make this the newest slot.  Everything its promotion reads must be set
+  // first: from here on the heartbeat handler may promote it.
+  inline void SporkSlot::link() noexcept {
     prev = spork_deque_back.load();
     *prev = this;
-    auto x = &next;
     spork_deque_back = &next;
   }
 
@@ -300,7 +553,7 @@ struct WorkStealingJob {
   inline void SporkSlot::promote() {
     heartbeat_tokens = heartbeat_tokens - 1;
     promoted = true;
-    (*promfn)();
+    promfn(this);
   }
 
   inline void SporkSlot::promote_front() {
@@ -327,6 +580,7 @@ struct WorkStealingJob {
     // This stack's computation state while it is not running.
     async_signal_safe_pointer<SporkSlot>* saved_back;
     unsigned int saved_tokens;
+    std::uint64_t saved_mark;
     bool saved_disable;
     fcontext_t entry;        // enters fiber_trampoline on this stack
     std::size_t stack_size;      // context that enters fiber_body for the first time
@@ -421,12 +675,14 @@ struct WorkStealingJob {
     spork_deque_front_p = &f->deque_front;
     spork_deque_back = f->saved_back;
     heartbeat_tokens = f->saved_tokens;
+    task_mark = f->saved_mark;
     disable_heartbeats = f->saved_disable;
   }
 
   inline void fiber_save(Fiber* f) noexcept {
     f->saved_back = spork_deque_back.load();
     f->saved_tokens = heartbeat_tokens;
+    f->saved_mark = task_mark;
     f->saved_disable = disable_heartbeats;
   }
 
@@ -448,17 +704,25 @@ struct WorkStealingJob {
     f->deque_front.promoted = true;
     f->deque_front.next.store(nullptr);
     f->saved_back = &f->deque_front.next;
-    f->saved_tokens = TOKENS_PER_HEARTBEAT;
+    f->saved_tokens = job->tokens;
+    f->saved_mark = tsc_now();   // a right side's mark is when it starts
     f->saved_disable = false;
     fiber_install(f);
     fiber_switching = false;
     fiber_drain();
+    // With SPORK_IGNORE_HB_WORK the job's clock starts here, after the switch
+    // onto its fiber; beats are not yet acted on (this thread is idle).
+    if constexpr (IGNORE_HB_WORK) task_mark = tsc_now();
     start_heartbeats();
 
     job->thief = WorkStealingJob::worker_id();
     job->run();
 
     fiber_switching = true;
+    // For the join, if we are second to it.  Written before either way of
+    // telling the parent we are done, and read only by a parent that waited.
+    job->tokens = heartbeat_tokens;
+    job->child_progress = task_elapsed(job->child_end);
     if (job->handoff) {
       if (job->join_count.fetch_sub(1, std::memory_order_acq_rel) != 2) {
         // Second to the join: take over the parent's continuation on the stack
@@ -485,6 +749,7 @@ struct WorkStealingJob {
     SporkSlot* caller_front = spork_deque_front_p;
     auto* caller_back = spork_deque_back.load();
     unsigned int caller_tokens = heartbeat_tokens;
+    std::uint64_t caller_mark = task_mark;
     bool caller_disable = disable_heartbeats;
     Fiber* caller_fiber = current_fiber;
 
@@ -512,19 +777,32 @@ struct WorkStealingJob {
     spork_deque_front_p = caller_front;
     spork_deque_back = caller_back;
     heartbeat_tokens = caller_tokens;
+    task_mark = caller_mark;
     disable_heartbeats = caller_disable;
     fiber_switching = false;
   }
 
+  // A job nobody stole is run here (fast_clone); at the join of a stolen one
+  // the continuation's tokens and mark come from both sides (join_tokens).
   inline void WorkStealingJob::sync() {
-    if (try_dequeue()) {              // never stolen: run it here, on our budget
-      fast_clone();
+    // With SPORK_IGNORE_HB_WORK the parent's clock stops here, on arrival.
+    std::uint64_t arrived = 0;
+    if constexpr (IGNORE_HB_WORK) arrived = tsc_now();
+    if (try_dequeue()) {              // never stolen: run it here
+      fast_clone(arrived);
       return;
     }
     if (!handoff) {                   // parent's stack is pinned: wait for the child
-      if (!finished()) wait();
-      add_heartbeat_tokens(STEAL_REFUND);
-      //add_heartbeat_tokens(TOKENS_PER_HEARTBEAT);
+      if (!finished()) {              // the child will be second
+        pause_heartbeats();           // before reading our clock and balance: no beat may change them now
+        const std::uint64_t my_progress = IGNORE_HB_WORK ? clock_at(arrived) : task_elapsed();
+        const unsigned int my_tokens = heartbeat_tokens;
+        get_current_scheduler().wait_for_job(this);
+        join_tokens(my_progress, my_tokens, child_progress, tokens);
+        start_heartbeats();
+        return;
+      }
+      join_tokens_running(child_progress, tokens, arrived);
       return;
     }
     if (join_count.load(std::memory_order_acquire) != 1) {
@@ -534,6 +812,7 @@ struct WorkStealingJob {
       Fiber* me = current_fiber;
       fiber_switching = true;
       fiber_save(me);
+      parent_progress = IGNORE_HB_WORK ? clock_at(arrived) : task_elapsed();
       fiber_post_join = this;
       transfer_t t = jump_fcontext(fiber_home_ctx, nullptr);
       // Resumed.  A thief resuming us runs on a thread whose home handle its
@@ -541,42 +820,39 @@ struct WorkStealingJob {
       if (t.data == RESUME_FROM_HOME) fiber_home_ctx = t.fctx;
       // Resumed: by the thief if it arrived second, or by our own thread's
       // idle loop if the counter showed we were second after all.
-      fiber_install(me);
+      fiber_install(me);   // our balance is back in heartbeat_tokens
+      if (t.data == RESUME_FROM_THIEF)   // the thief was second: its reading is the join's time
+        join_tokens(parent_progress, heartbeat_tokens, child_progress, tokens, child_end);
+      else                               // we were second after all
+        join_tokens(child_progress, tokens, parent_progress, heartbeat_tokens);
       fiber_switching = false;
       fiber_drain();
+      return;
     }
     // Otherwise the thief had already finished, so we are trivially second
     // and never left this stack.
-    add_heartbeat_tokens(STEAL_REFUND);
+    join_tokens_running(child_progress, tokens, arrived);
   }
 
-  template <typename PromLambda>
   __attribute__((noinline))
-  void SporkSlot::eager_promote(const PromLambda&& prom) {
+  inline void SporkSlot::eager_promote() {
     bool before = disable_heartbeats;
     disable_heartbeats = true;
     if (heartbeat_tokens && !promoted) {
-      heartbeat_tokens = heartbeat_tokens - 1;
-      promoted = true;
-      fwd(prom)();
+      std::uint64_t start = 0;
+      if constexpr (IGNORE_HB_WORK) start = tsc_now();
+      promote();
+      // With SPORK_IGNORE_HB_WORK the promotion's time is not the
+      // computation's work (beats are disabled, so the mark is ours to move).
+      if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (tsc_now() - start);
     }
     disable_heartbeats = before;
   }
-
-  template <typename PromLambda>
-  struct PromSpork : PromFn {
-    const PromLambda&& prom;
-    void operator()() const override {
-      fwd(prom)();
-    }
-    PromSpork(const PromLambda&& _prom) : prom(fwd(_prom)) {}
-  };
 
   inline volatile unsigned int* num_heartbeats = nullptr;
   inline volatile unsigned int* missed_heartbeats = nullptr;
 
   inline void init_heartbeat_stats() {
-    if (const char* e = std::getenv("SPORK_STEAL_REFUND")) STEAL_REFUND = std::max(0, std::atoi(e));
     if (const char* e = std::getenv("SPORK_JOIN_THIEF_TRIES")) JOIN_THIEF_TRIES = std::max(0, std::atoi(e));
     if (const char* e = std::getenv("SPORK_JOIN_THIEF_DELAY_NS")) JOIN_THIEF_DELAY_NS = std::max(0, std::atoi(e));
 #ifdef RECORD_HEARTBEAT_STATS
@@ -608,6 +884,7 @@ struct WorkStealingJob {
   inline void heartbeat_handler(int sig) {
     if (heartbeats_done.load(std::memory_order_relaxed)) return;
     int saved_errno = errno;
+    const std::uint64_t now = tsc_now();
     // fiber_switching covers the window in which the thread-local view of the
     // computation (deque pointers, tokens) does not match the stack it is
     // about to run on.  A beat lost there is harmless; promoting from the
@@ -617,8 +894,26 @@ struct WorkStealingJob {
       volatile unsigned int& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
       hbs = hbs + 1;
 #endif
-      add_heartbeat_tokens(TOKENS_PER_HEARTBEAT);
+      // Pro-rated: settle the clock since the mark, at TOKENS_PER_HEARTBEAT
+      // tokens per interval, together with the balance.  Below the cap the
+      // remainder (under one token's worth) stays on the clock, possibly
+      // reaching back past this beat, and a beat that converts nothing leaves
+      // the mark alone; at the cap the rest is dropped.  A clock of at least N,
+      // from a late or missed beat, is worth TOKENS_PER_HEARTBEAT tokens by
+      // itself, so by default it reaches the cap.
+      const std::uint64_t N = heartbeat_interval_tsc;
+      settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
       SporkSlot::promote_front();
+      // With SPORK_IGNORE_HB_WORK, this beat's own time, the handler and the
+      // promotions it made, is not the computation's work: move the mark past
+      // it, so that no later conversion credits it as clock time (in the
+      // proofs a beat takes no time).  The mark stays no later than now, so
+      // the clock stays non-negative.  Beats that are not acted on below
+      // leave the mark alone: the interrupted code may be updating it (beats
+      // disabled, a fiber switch), or there is no running computation (idle).
+      // The kernel's part of a beat, delivering the signal and returning from
+      // it, is not seen here and stays on the clock.
+      if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (tsc_now() - now);
     } else {
 #ifdef RECORD_HEARTBEAT_STATS
       volatile unsigned int& mhbs = missed_heartbeats[spork::WorkStealingJob::worker_id()];
@@ -659,6 +954,8 @@ inline void start_heartbeats() noexcept {
 
     timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
     heartbeat_timer_live = true;
+    calibrate_tsc();
+    if (current_fiber == nullptr) task_mark = tsc_now();   // a thread's own stack starts its mark here
     timer_settime(heartbeat_timer, 0, &heartbeat_its, nullptr);
   }
 
@@ -680,19 +977,33 @@ inline void pause_heartbeats() noexcept {
   heartbeats_idle = true;
 }
 
+// Run body() as the left side of a promotable fork whose slot is `slot`
+// (built, not yet linked; it is linked here, and promoted at once if this
+// computation holds tokens).  Returns whether it was promoted.
+template <typename BodyLambda>
+__attribute__((always_inline))
+inline bool spork_slot(SporkSlot& slot, const BodyLambda& body) {
+  static_assert(std::is_invocable_v<const BodyLambda&>);
+  slot.link();
+  if (heartbeat_tokens) [[unlikely]]
+    slot.eager_promote();
+  body();
+  return slot.close();
+}
+
+// The general form: prom() is the promotion.
 template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
-inline bool with_prom_handler(const BodyLambda&& body, const PromLambda&& prom) {
-  static_assert(std::is_invocable_v<BodyLambda&&>);
-  static_assert(std::is_invocable_v<PromLambda&&>);
+inline bool spork(const BodyLambda& body, const PromLambda& prom) {
+  static_assert(std::is_invocable_v<const BodyLambda&>);
+  static_assert(std::is_invocable_v<const PromLambda&>);
 
-  const PromSpork<PromLambda> promfn(fwd(prom));
-
-  SporkSlot slot(&promfn);
-  if (heartbeat_tokens) [[unlikely]]
-    slot.eager_promote(fwd(prom));
-  fwd(body)();
-  return slot.close();
+  struct Slot : SporkSlot {
+    const PromLambda& prom;
+    explicit Slot(const PromLambda& p) noexcept
+      : SporkSlot([](SporkSlot* s) { static_cast<Slot*>(s)->prom(); }), prom(p) {}
+  } slot(prom);
+  return spork_slot(slot, body);
 }
 
 } // namespace spork

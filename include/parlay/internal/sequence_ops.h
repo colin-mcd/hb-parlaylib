@@ -172,10 +172,10 @@ inline size_t num_blocks(size_t n, size_t block_size) {
 template <typename F>
 void sliced_for(size_t n, size_t block_size, const F &f, flags fl = no_flag) {
   size_t l = num_blocks(n, block_size);
-  auto body = [&](size_t i) {
+  auto body = [f = cap_body<size_t, size_t, size_t>(f), block_size, n](size_t i) {
     size_t s = i * block_size;
     size_t e = (std::min)(s + block_size, n);
-    f(i, s, e);
+    f()(i, s, e);
   };
   parallel_for(0, l, body, 1, 0 != (fl & fl_conservative));
 }
@@ -201,13 +201,12 @@ auto reduce(Seq const &A, Monoid&& m, flags fl = no_flag) {
   if (fl & fl_sequential)
     return reduce_serial(A, m);
 
-  T result = m.identity;
-  spork::parfor(
-      size_t{0}, A.size(), result,
+  T result = spork::parfor(
+      size_t{0}, A.size(), m.identity,
       [&A, &m](size_t i, T& partial) {
         partial = m(std::move(partial), A[i]);
       },
-      std::move(m));
+      m);
   return result;
 }
 

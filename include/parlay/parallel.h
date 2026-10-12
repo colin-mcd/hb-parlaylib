@@ -12,6 +12,8 @@
 #include <type_traits>  // IWYU pragma: keep
 #include <utility>
 
+#include "internal/capped_copy.h"
+
 // ----------------------------------------------------------------------------
 // All scheduler plugins are required to implement the
 // following four functions to integrate with parlay:
@@ -67,10 +69,10 @@ inline void blocked_for(size_t start, size_t end, size_t block_size, F&& f, bool
   assert(block_size > 0);
   if (start < end) {
     size_t n_blocks = (end - start + block_size - 1) / block_size;
-    parallel_for(0, n_blocks, [&](size_t i) {
+    parallel_for(0, n_blocks, [f = internal::cap_body<size_t, size_t, size_t>(f), start, end, block_size](size_t i) {
       size_t s = start + i * block_size;
       size_t e = (std::min)(s + block_size, end);
-      f(i, s, e);
+      f()(i, s, e);
     }, 0, conservative);
   }
 }
@@ -189,6 +191,10 @@ inline size_t worker_id() {
   return internal::get_current_scheduler().worker_id();
 }
 
+// parallel_for still looks the scheduler up, although spork ignores it: once
+// a loop, not a fork, so it costs little, and without it nqueens ran 70%
+// slower (2026-10-09), because the smaller queens() was then inlined into its
+// loop body, which then no longer inlined into spork's loop.
 template <typename F>
 inline void parallel_for(size_t start, size_t end, F&& f, long, bool conservative) {
   static_assert(std::is_invocable_v<F&, size_t>);
@@ -202,11 +208,13 @@ inline void parallel_for(size_t start, size_t end, F&& f, long, bool conservativ
   }
 }
 
+// par_do does not look the scheduler up: spork ignores it (see
+// fork_join_scheduler::pardo).
 template <typename Lf, typename Rf>
-inline void par_do(Lf&& left, Rf&& right, bool conservative) {
+inline void par_do(Lf&& left, Rf&& right, bool /* conservative */) {
   static_assert(std::is_invocable_v<Lf&&>);
   static_assert(std::is_invocable_v<Rf&&>);
-  return fork_join_scheduler::pardo(internal::get_current_scheduler(), std::forward<Lf>(left), std::forward<Rf>(right), conservative);
+  fork_join_scheduler::pardo(std::forward<Lf>(left), std::forward<Rf>(right));
 }
 
 // Execute the given function f() on p threads inside its own private scheduler instance

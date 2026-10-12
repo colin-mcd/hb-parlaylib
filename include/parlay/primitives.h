@@ -1097,14 +1097,16 @@ auto map_tokens(R&& r, UnaryOp&& f, UnaryPred&& is_space = is_whitespace) {
     else return sequence<f_return_type>();
   }
 
-  auto is_start = [&](size_t i) { return ((i == 0) || is_space(A[i - 1])) && (i != n) && !(is_space(A[i])); };
-  auto is_end = [&](size_t i) { return ((i == n) || (is_space(A[i]))) && (i != 0) && !is_space(A[i - 1]); };
+  // By-value captures: these run per character in out-of-line block loops,
+  // where by-reference captures are reloaded after every store.
+  auto is_start = [A, n, is_space](size_t i) { return ((i == 0) || is_space(A[i - 1])) && (i != n) && !(is_space(A[i])); };
+  auto is_end = [A, n, is_space](size_t i) { return ((i == n) || (is_space(A[i]))) && (i != 0) && !is_space(A[i - 1]); };
 
   // associative combining function
   // first = # of starts, second = index of last start
   auto g = [](ipair a, ipair b) { return (b.first == 0) ? a : ipair(a.first + b.first, b.second); };
 
-  auto in = internal::delayed_tabulate(n + 1, [&](size_t i) -> ipair {
+  auto in = internal::delayed_tabulate(n + 1, [is_start](size_t i) -> ipair {
     return is_start(i) ? ipair(1, i) : ipair(0, 0); });
   auto [offsets, sum] = internal::delayed::scan(in, g, ipair(0, 0));
 
@@ -1113,14 +1115,14 @@ auto map_tokens(R&& r, UnaryOp&& f, UnaryPred&& is_space = is_whitespace) {
   auto start = std::begin(r);
 
   if constexpr (std::is_same_v<f_return_type, void>)
-    internal::delayed::apply(z, [&](auto&& x) {
+    internal::delayed::apply(z, [is_end, start, &f](auto&& x) {
       if (is_end(std::get<1>(x))) f(make_slice(std::get<0>(x).second + start, std::get<1>(x) + start));
     });
   else {
     auto result = sequence<f_return_type>::uninitialized(sum.first);
-    internal::delayed::apply(z, [&](auto&& x) {
+    internal::delayed::apply(z, [is_end, start, out = result.begin(), &f](auto&& x) {
       if (is_end(std::get<1>(x)))
-        assign_uninitialized(result[std::get<0>(x).first - 1],
+        assign_uninitialized(out[std::get<0>(x).first - 1],
                              f(make_slice(start + std::get<0>(x).second, start + std::get<1>(x))));
     });
     return result;

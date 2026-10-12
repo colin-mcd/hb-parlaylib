@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "internal/capped_copy.h"
 #include "internal/work_stealing_deque.h"         // IWYU pragma: keep
 #include "internal/work_stealing_job.h"
 
@@ -48,9 +49,9 @@ namespace spork {
   extern std::atomic<bool> heartbeats_done;
   void pause_heartbeats() noexcept;
   template <typename LambdaL, typename LambdaR>
-  void par(const LambdaL&& lamL, const LambdaR&& lamR);
+  void par(const LambdaL& lamL, const LambdaR& lamR);
   template <typename idx, typename BodyLambda>
-  void parfor(idx i, idx j, const BodyLambda&& body);
+  void parfor(idx i, idx j, const BodyLambda& body);
 }
 
 // PARLAY_ELASTIC_STEAL_TIMEOUT sets the number of microseconds
@@ -83,9 +84,13 @@ struct scheduler {
 
     worker_id_type worker_id;
     scheduler* my_scheduler;
+    // my_scheduler->deques[worker_id], so that pushing and popping this
+    // worker's own jobs (every promotion and its join) look nothing else up.
+    internal::Deque<Job>* my_deque;
 
-    workerInfo() : worker_id(UNINITIALIZED), my_scheduler(nullptr) {}
-    workerInfo(std::size_t worker_id_, scheduler* s) : worker_id(worker_id_), my_scheduler(s) {}
+    constexpr workerInfo() : worker_id(UNINITIALIZED), my_scheduler(nullptr), my_deque(nullptr) {}
+    constexpr workerInfo(std::size_t worker_id_, scheduler* s, internal::Deque<Job>* d)
+        : worker_id(worker_id_), my_scheduler(s), my_deque(d) {}
 
     workerInfo& operator=(const workerInfo&) = delete;
     workerInfo(const workerInfo&) = delete;
@@ -94,6 +99,7 @@ struct scheduler {
       if (this != &w) {
         worker_id = std::exchange(w.worker_id, UNINITIALIZED);
         my_scheduler = std::exchange(w.my_scheduler, nullptr);
+        my_deque = std::exchange(w.my_deque, nullptr);
       }
       return *this;
     }
@@ -111,7 +117,10 @@ struct scheduler {
   // before it goes to sleep to save CPU time.
   constexpr static std::chrono::microseconds STEAL_TIMEOUT{PARLAY_ELASTIC_STEAL_TIMEOUT};
 
-  static inline thread_local workerInfo worker_info{};
+  // constinit: constant-initialized, so it is addressed directly rather than
+  // through a TLS init function call on every access (every worker_id() and
+  // scheduler lookup, including spork's promotions and joins).
+  static inline constinit thread_local workerInfo worker_info{};
 
  public:
 
@@ -127,16 +136,17 @@ struct scheduler {
       : num_threads(num_workers),
         num_deques(num_threads),
         num_awake_workers(num_threads),
-        parent_worker_info(std::exchange(worker_info, workerInfo{0, this})),
+        parent_worker_info(std::exchange(worker_info, workerInfo{0, this, nullptr})),
         deques(num_deques),
         attempts(num_deques),
         spawned_threads(),
         finished_flag(false) {
+    worker_info.my_deque = &deques[0];   // deques is never resized
 
     // Spawn num_threads many threads on startup
     for (worker_id_type i = 1; i < num_threads; ++i) {
       spawned_threads.emplace_back([&, i]() {
-        worker_info = {i, this};
+        worker_info = {i, this, &deques[i]};
         worker();
       });
     }
@@ -152,11 +162,26 @@ struct scheduler {
 
   // Push onto local stack.
   void spawn(Job* job) {
-    int id = worker_id();
-    [[maybe_unused]] bool first = deques[id].push_bottom(job);
+    [[maybe_unused]] bool first = worker_info.my_deque->push_bottom(job);
 #if PARLAY_ELASTIC_PARALLELISM
     if (first) wake_up_a_worker();
 #endif
+  }
+
+  // spawn and get_own_job's deque on this thread's current scheduler, found
+  // without looking the scheduler up; null if the thread has none yet.
+  static internal::Deque<Job>* own_deque() { return worker_info.my_deque; }
+
+  // spawn on this thread's current scheduler, through own_deque(): false,
+  // and nothing done, if the thread has none yet.
+  static bool spawn_here(Job* job) {
+    internal::Deque<Job>* d = worker_info.my_deque;
+    if (d == nullptr) [[unlikely]] return false;
+    [[maybe_unused]] bool first = d->push_bottom(job);
+#if PARLAY_ELASTIC_PARALLELISM
+    if (first) worker_info.my_scheduler->wake_up_a_worker();
+#endif
+    return true;
   }
 
   // Wait until the given condition is true.
@@ -199,8 +224,7 @@ struct scheduler {
 
   // Pop from local stack.
   Job* get_own_job() {
-    auto id = worker_id();
-    return deques[id].pop_bottom();
+    return worker_info.my_deque->pop_bottom();
   }
 
   worker_id_type num_workers() { return num_threads; }
@@ -408,11 +432,31 @@ class fork_join_scheduler {
 
  public:
 
-  // Fork two thunks and wait until they both finish using Spork's par
+  // Fork two thunks and wait until they both finish using Spork's par.
+  // Spork never uses the scheduler, so parlay::par_do calls the overload
+  // without one: looking it up on every fork (internal::get_current_scheduler,
+  // then a TLS init call and guard checks) cost fib 13%.  A promotion looks
+  // the scheduler up itself when it spawns (WorkStealingJob::get_current_scheduler).
+  // spork::par takes its callables by const reference, so ones callable as
+  // const are passed as they are; a wrapper lambda would be one more closure
+  // for every fork to build and to call through (fib: 5 instructions a fork,
+  // -10%).  Others (mutable lambdas, or functors whose call operator is not
+  // const) are called through wrappers that keep their value category.
+  template <typename L, typename R>
+  __attribute__((always_inline))
+  static void pardo(L&& left, R&& right) {
+    if constexpr (std::is_invocable_v<const std::remove_reference_t<L>&> &&
+                  std::is_invocable_v<const std::remove_reference_t<R>&>) {
+      spork::par(left, right);
+    } else {
+      spork::par([&]() { std::forward<L>(left)(); },
+                 [&]() { std::forward<R>(right)(); });
+    }
+  }
+
   template <typename L, typename R>
   static void pardo(scheduler_t&, L&& left, R&& right, bool = false) {
-    spork::par([&]() { std::forward<L>(left)(); },
-               [&]() { std::forward<R>(right)(); });
+    pardo(std::forward<L>(left), std::forward<R>(right));
   }
 
   // Parallel loop from start to end using Spork's parfor (ignoring granularity)
@@ -423,7 +467,9 @@ class fork_join_scheduler {
       f(start);
       return;
     }
-    spork::parfor(start, end, [&f](size_t i) { f(i); });
+    // The body is held by value when that is free, so its captures are not
+    // reloaded after every store the loop makes (internal/capped_copy.h).
+    spork::parfor(start, end, [f = internal::cap_body<size_t>(f)](size_t i) { SPORK_LOOP_BODY_CALL f()(i); });
   }
 
  private:

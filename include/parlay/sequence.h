@@ -531,12 +531,12 @@ class PARLAY_TRIVIALLY_RELOCATABLE sequence : protected sequence_internal::seque
     storage.initialize_capacity(n);
     storage.set_size(n);
     auto buffer = storage.data();
-    parallel_for(0, n, [&](size_t i) {
+    parallel_for(0, n, [this, buffer, f = internal::cap_body<size_t>(f)](size_t i) {
       if constexpr (std::is_constructible_v<value_type, std::invoke_result_t<F&&, size_t>>) {
-        storage.initialize(&buffer[i], f(i));
+        storage.initialize(&buffer[i], f()(i));
       }
       else {
-        storage.initialize_with_copy_elision(&buffer[i], [&]() { return f(i); });
+        storage.initialize_with_copy_elision(&buffer[i], [&]() { return f()(i); });
       }
     }, granularity);
   }
@@ -546,17 +546,17 @@ class PARLAY_TRIVIALLY_RELOCATABLE sequence : protected sequence_internal::seque
   void initialize_default(size_t n) {
     storage.initialize_capacity(n);
     auto buffer = storage.data();
-    parallel_for(0, n, [&](size_t i) {      // Calling initialize with
-      storage.initialize(buffer + i);                 // no arguments performs
-    }, initialization_granularity(n));       // value initialization
+    parallel_for(0, n, [this, buffer](size_t i) {  // Calling initialize with
+      storage.initialize(buffer + i);              // no arguments performs
+    }, initialization_granularity(n));             // value initialization
     storage.set_size(n);
   }
 
   void initialize_fill(size_t n, const value_type& v) {
     storage.initialize_capacity(n);
     auto buffer = storage.data();
-    parallel_for(0, n, [&](size_t i) {
-      storage.initialize_explicit(buffer + i, v);
+    parallel_for(0, n, [this, buffer, v = internal::cap(v)](size_t i) {
+      storage.initialize_explicit(buffer + i, v());
     }, copy_granularity(n));
     storage.set_size(n);
   }
@@ -569,8 +569,8 @@ class PARLAY_TRIVIALLY_RELOCATABLE sequence : protected sequence_internal::seque
       auto n = std::distance(first, last);
       storage.initialize_capacity(n);
       auto buffer = storage.data();
-      parallel_for(0, n, [&](size_t i) {
-        storage.initialize(buffer + i, first[i]);
+      parallel_for(0, n, [this, buffer, first = internal::cap(first)](size_t i) {
+        storage.initialize(buffer + i, first()[i]);
       }, copy_granularity(n));
       storage.set_size(n);
     }
@@ -666,10 +666,20 @@ class PARLAY_TRIVIALLY_RELOCATABLE sequence : protected sequence_internal::seque
     }
     auto n = size();
     auto self = begin();
-    size_t i;
-    for (i = 0; i < (std::min)(granularity, n); i++)
+    size_t m = (std::min)(granularity, n);
+    for (size_t i = 0; i < m; i++)
       if (!(self[i] == other[i])) return false;
-    if (i == n) return true;
+    return m == n || compare_equal_rest(other, granularity);
+  }
+
+  // The parallel comparison of everything after the first granularity
+  // elements.  Out of line, so that compare_equal stays small enough to inline:
+  // its parallel_for, a scheduler call that is never inlined, would otherwise
+  // keep every comparison of short sequences out of line too.
+  template<typename Iterator_>
+  [[gnu::noinline]] bool compare_equal_rest(Iterator_ other, size_t granularity) const {
+    auto n = size();
+    auto self = begin();
     size_t start = granularity;
     size_t block_size = 2 * granularity;
     bool matches = true;

@@ -126,7 +126,8 @@ struct alignas(uint64_t) sequence_base {
         auto buffer = data();
         auto other_buffer = other.data();
         parallel_for(
-            0, n, [&](size_t i) { initialize_explicit(buffer + i, other_buffer[i]); }, copy_granularity(n));
+            0, n, [this, buffer, other_buffer](size_t i) { initialize_explicit(buffer + i, other_buffer[i]); },
+            copy_granularity(n));
         set_size(n);
       }
     }
