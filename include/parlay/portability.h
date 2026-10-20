@@ -19,13 +19,36 @@
 
 namespace parlay {
 
-// PARLAY_INLINE: Ask the compiler politely to inline the given function.
+// PARLAY_ALWAYS_INLINE: Force the compiler to inline the given function.  The
+// attribute alone, for where `inline` cannot go, such as a lambda's call
+// operator: [&]() PARLAY_ALWAYS_INLINE { ... }
 #if defined(__GNUC__)
-#define PARLAY_INLINE inline  __attribute__((__always_inline__))
+#define PARLAY_ALWAYS_INLINE __attribute__((__always_inline__))
+#else
+#define PARLAY_ALWAYS_INLINE
+#endif
+
+// PARLAY_INLINE: Force the compiler to inline the given function, which is
+// declared inline.
+#if defined(__GNUC__)
+#define PARLAY_INLINE inline PARLAY_ALWAYS_INLINE
 #elif defined(_MSC_VER)
 #define PARLAY_INLINE __forceinline
 #else
 #define PARLAY_INLINE inline
+#endif
+
+// PARLAY_INLINE_CALL: Force the call in the statement that follows to be
+// inlined, for a callee that cannot be declared PARLAY_INLINE, such as a
+// caller's lambda.  It is a statement attribute, which only Clang (15 and
+// later) has; elsewhere the call is left to the inliner.
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(clang::always_inline)
+#define PARLAY_INLINE_CALL [[clang::always_inline]]
+#endif
+#endif
+#ifndef PARLAY_INLINE_CALL
+#define PARLAY_INLINE_CALL
 #endif
 
 // PARLAY_NOINLINE: Ask the compiler to *not* inline the given function

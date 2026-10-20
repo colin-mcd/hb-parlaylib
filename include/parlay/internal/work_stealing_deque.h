@@ -4,9 +4,12 @@
 
 #include <cassert>
 
+#include <array>
 #include <atomic>
-#include <iostream>
+#include <cstdlib>
 #include <utility>
+
+#include <unistd.h>
 
 namespace parlay {
 namespace internal {
@@ -55,7 +58,9 @@ struct Deque {
     deq[local_bot].job.store(job, std::memory_order_release);  // shared store
     local_bot += 1;
     if (local_bot == q_size) {
-      std::cerr << "internal error: scheduler queue overflow\n";
+      // write(2), not iostreams: a promotion in the heartbeat handler can get here.
+      static constexpr char msg[] = "internal error: scheduler queue overflow\n";
+      [[maybe_unused]] ssize_t written = write(STDERR_FILENO, msg, sizeof(msg) - 1);
       std::abort();
     }
     bot.store(local_bot, std::memory_order_seq_cst);  // shared store

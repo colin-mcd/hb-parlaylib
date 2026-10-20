@@ -4,6 +4,7 @@
 #include "spork_scheduler.h"
 #include "capped_copy.h"
 #include "../monoid.h"
+#include "../portability.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,15 @@ extern "C" void __spork_unroll_loop(const void* site) noexcept;
 extern "C" unsigned int __spork_get_unroll_factor(const void* site) noexcept;
 #endif
 
+// Spork's parallel loops call their body PARLAY_INLINE_CALL (parfor_ below,
+// and the wrappers between it and parallel_for's callable in scheduler.h), so
+// that a function that recurses through its own loop body (nqueens) is split
+// at the function, never at the body, whatever the inliner's size estimates.
+// Left to the inliner, nqueens flipped to calling its body out of line for
+// every iteration (+70%) when an unrelated change made the function smaller.
+// Measured 2026-10-09 against leaving it to the inliner: PBBS at 80 cores
+// geomean 0.999, delaunayRefine perhaps 3% slower, binaries 0.6% larger.
+// (cap-parlaylib's sequential elision forces its parallel_for the same way.)
 namespace spork {
 
 template <typename idx, typename BodyLambda, typename BinOp>
@@ -59,8 +69,7 @@ void seqfor(idx n, const BodyLambda& body) {
 
 namespace { // private
   template <typename idx>
-  __attribute__((always_inline))
-  constexpr const idx midpoint(idx i, idx j) noexcept {
+  PARLAY_INLINE constexpr const idx midpoint(idx i, idx j) noexcept {
     static_assert(std::is_integral_v<idx>);
     return i + ((j - i) / 2);
   }
@@ -74,7 +83,7 @@ namespace { // private
   // call site, and whether it happened would depend on the inliner's size
   // estimates for the body and everything around it.
   template <typename idx, typename BodyLambda, typename BinOp>
-  [[gnu::noinline]] parlay::monoid_value_type_t<BinOp> parfor_(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
+  PARLAY_NOINLINE parlay::monoid_value_type_t<BinOp> parfor_(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
     static_assert(std::is_integral_v<idx>);
     static_assert(parlay::is_monoid_v<BinOp>);
     using A = parlay::monoid_value_type_t<BinOp>;
@@ -95,7 +104,7 @@ namespace { // private
     // protocol, which cost more than a short loop's iterations do.
     if (j - i <= unroll_factor) {
       const auto b = body;   // a copy, as the loop below takes: stores cannot clobber its captures
-      for (; i < j; ++i) SPORK_LOOP_BODY_CALL b(i, a);
+      for (; i < j; ++i) PARLAY_INLINE_CALL b(i, a);
       return a;
     }
 
@@ -189,12 +198,12 @@ namespace { // private
     SpwnJob& l = slot.ls.job;
     SpwnJob& r = slot.rs.job;
 
-    bool promoted = spork_slot(slot, [&, body = body] () __attribute__((always_inline)) {
+    bool promoted = spork_slot(slot, [&, body = body] () PARLAY_ALWAYS_INLINE {
         #ifdef VOLATILE_UNROLL
         __spork_unroll_loop(&unroll_site);
         #endif
         for (; i < loop_end; ) {
-          SPORK_LOOP_BODY_CALL body(i, a);
+          PARLAY_INLINE_CALL body(i, a);
           ++i;
           sig_safe_i = static_cast<sig_atomic_t>(i);
         }
@@ -221,13 +230,13 @@ namespace { // private
   // same accumulator in order.  Out of line and cold, so that the common path
   // in parfor below costs its callers nothing for it.
   template <typename idx, typename BodyLambda, typename BinOp>
-  [[gnu::noinline, gnu::cold]] parlay::monoid_value_type_t<BinOp> parfor_blocks(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
+  PARLAY_NOINLINE PARLAY_COLD parlay::monoid_value_type_t<BinOp> parfor_blocks(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
     using A = parlay::monoid_value_type_t<BinOp>;
     for (idx s = i; s < j; ) {
       const sig_atomic_t n = static_cast<sig_atomic_t>(std::min<idx>(SIG_ATOMIC_MAX, j - s));
       a = parfor_(sig_atomic_t{0}, n, a,
                   [s, body = body] (sig_atomic_t k, A& a) {
-                    SPORK_LOOP_BODY_CALL body(s + static_cast<idx>(k), a);
+                    PARLAY_INLINE_CALL body(s + static_cast<idx>(k), a);
                   }, binop);
       s += n;
     }
@@ -246,8 +255,7 @@ namespace { // private
 // still sent the common case through a sig_atomic_t wrapper, measured
 // slower on classify: +4.7% against df87c0b, +1.3% then.)
 template <typename idx, typename BodyLambda, typename BinOp>
-__attribute__((always_inline))
-inline parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
+PARLAY_INLINE parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, parlay::monoid_value_type_t<BinOp> a, const BodyLambda& body, const BinOp& binop) {
   if (i >= j) return a;
   if constexpr (sizeof(idx) <= sizeof(sig_atomic_t)) {
     return parfor_(i, j, a, body, binop);
@@ -265,7 +273,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda& body, 
 
 template <typename idx, typename BodyLambda>
 void parfor(idx i, idx j, const BodyLambda& body) {
-  char _ = parfor(i, j, [body = body] (idx i, char _) { SPORK_LOOP_BODY_CALL body(i); }, parlay::plus<char>());
+  char _ = parfor(i, j, [body = body] (idx i, char _) { PARLAY_INLINE_CALL body(i); }, parlay::plus<char>());
 }
 
 template <typename idx, typename BodyLambda>

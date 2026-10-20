@@ -677,7 +677,7 @@ class PARLAY_TRIVIALLY_RELOCATABLE sequence : protected sequence_internal::seque
   // its parallel_for, a scheduler call that is never inlined, would otherwise
   // keep every comparison of short sequences out of line too.
   template<typename Iterator_>
-  [[gnu::noinline]] bool compare_equal_rest(Iterator_ other, size_t granularity) const {
+  PARLAY_NOINLINE bool compare_equal_rest(Iterator_ other, size_t granularity) const {
     auto n = size();
     auto self = begin();
     size_t start = granularity;

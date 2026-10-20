@@ -6,22 +6,6 @@
 #include <memory>
 #include <type_traits>
 
-// How spork's parallel loops call their body (parfor_, and the wrappers
-// between it and parallel_for's callable): always forced inline, so that a
-// function that recurses through its own loop body (nqueens) is split at the
-// function, never at the body, whatever the inliner's size estimates.  Left
-// to the inliner, nqueens flipped to calling its body out of line for every
-// iteration (+70%) when an unrelated change made the function smaller.
-// Measured 2026-10-09 against leaving it to the inliner: PBBS at 80 cores
-// geomean 0.999, delaunayRefine perhaps 3% slower, binaries 0.6% larger.
-// (Forcing the sequential elision's parallel_for the same way cost PBBS
-// invertedIndex 7.5% there, so that one is not forced.)
-#if defined(__clang__)
-#define SPORK_LOOP_BODY_CALL [[clang::always_inline]]
-#else
-#define SPORK_LOOP_BODY_CALL
-#endif
-
 namespace parlay {
 namespace internal {
 

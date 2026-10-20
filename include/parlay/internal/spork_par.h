@@ -5,12 +5,12 @@
 #include <type_traits>
 
 #include "spork_scheduler.h"
+#include "../portability.h"
 
 namespace spork {
 
 template <typename LambdaL, typename LambdaR>
-__attribute__((always_inline))
-void parSeq(const LambdaL& lamL, const LambdaR& lamR) {
+PARLAY_INLINE void parSeq(const LambdaL& lamL, const LambdaR& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
   lamL();
@@ -18,8 +18,7 @@ void parSeq(const LambdaL& lamL, const LambdaR& lamR) {
 }
 
 template <typename LambdaL, typename LambdaR>
-__attribute__((always_inline))
-void par(const LambdaL& lamL, const LambdaR& lamR) {
+PARLAY_INLINE void par(const LambdaL& lamL, const LambdaR& lamR) {
   static_assert(std::is_invocable_v<const LambdaL&>);
   static_assert(std::is_invocable_v<const LambdaR&>);
   

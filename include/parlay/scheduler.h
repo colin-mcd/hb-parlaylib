@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "portability.h"
+
 #include "internal/capped_copy.h"
 #include "internal/work_stealing_deque.h"         // IWYU pragma: keep
 #include "internal/work_stealing_job.h"
@@ -443,8 +445,7 @@ class fork_join_scheduler {
   // -10%).  Others (mutable lambdas, or functors whose call operator is not
   // const) are called through wrappers that keep their value category.
   template <typename L, typename R>
-  __attribute__((always_inline))
-  static void pardo(L&& left, R&& right) {
+  static PARLAY_INLINE void pardo(L&& left, R&& right) {
     if constexpr (std::is_invocable_v<const std::remove_reference_t<L>&> &&
                   std::is_invocable_v<const std::remove_reference_t<R>&>) {
       spork::par(left, right);
@@ -469,7 +470,7 @@ class fork_join_scheduler {
     }
     // The body is held by value when that is free, so its captures are not
     // reloaded after every store the loop makes (internal/capped_copy.h).
-    spork::parfor(start, end, [f = internal::cap_body<size_t>(f)](size_t i) { SPORK_LOOP_BODY_CALL f()(i); });
+    spork::parfor(start, end, [f = internal::cap_body<size_t>(f)](size_t i) { PARLAY_INLINE_CALL f()(i); });
   }
 
  private:
