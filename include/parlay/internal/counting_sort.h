@@ -233,11 +233,14 @@ auto group_by_small_int(slice<InIterator, InIterator> In,
 	auto out1 = r1.begin();
 	size_t c0 = Sums[i];
 	size_t c1 = s - c0;
+	// One store through a selected pointer rather than a store in each arm
+	// of an if: the keys are data, so a branch on them mispredicts.
 	for (size_t j = s; j < e; j++) {
-	  if (keys[j] == 0)
-	    assign_uninitialized(out0[c0++], in[j]);
-	  else
-	    assign_uninitialized(out1[c1++], in[j]);
+	  bool one = (keys[j] != 0);
+	  auto dst = one ? out1 + c1 : out0 + c0;
+	  assign_uninitialized(*dst, in[j]);
+	  c1 += one;
+	  c0 += !one;
 	}});
     return parlay::sequence<sequence<T>>{std::move(r0), std::move(r1)};
   }

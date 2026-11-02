@@ -27,11 +27,13 @@
 #include <cstddef>
 
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 
 #include "utilities.h"
+#include "internal/capped_copy.h"
 
 namespace parlay {
 
@@ -116,7 +118,7 @@ class delayed_sequence {
 #endif
 
     // Dereference
-    T operator*() const { return parent->f(index); }
+    T operator*() const { return fn()(index); }
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -186,7 +188,9 @@ class delayed_sequence {
 
     iterator operator+(size_t delta) const {
       assert(index + delta <= parent->last);
-      return iterator(parent, index + delta);
+      auto tmp = *this;
+      tmp.index += delta;
+      return tmp;
     }
 
     iterator& operator-=(size_t delta) {
@@ -197,7 +201,9 @@ class delayed_sequence {
 
     iterator operator-(size_t delta) const {
       assert(index - delta >= parent->first);
-      return iterator(parent, index - delta);
+      auto tmp = *this;
+      tmp.index -= delta;
+      return tmp;
     }
 
     std::ptrdiff_t operator-(const iterator& other) const {
@@ -210,7 +216,7 @@ class delayed_sequence {
 #pragma warning(disable: 4267) // conversion from 'size_t' to *, possible loss of data
 #endif
 
-    T operator[](size_t i) const { return parent->f(index + i); }
+    T operator[](size_t i) const { return fn()(index + i); }
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -218,11 +224,27 @@ class delayed_sequence {
 
    private:
 
+    // A small, trivially copyable function is copied into the iterator, so a
+    // loop over the iterator can keep the function's captures in registers.
+    // Called through parent, they would be reloaded after every store that
+    // may alias them, such as any store of a char.
+    static constexpr bool copies_f = internal::cap_copies_v<F, internal::delayed_function_copy_cap>;
+    struct no_copy {};
+    using f_copy = std::conditional_t<copies_f, std::optional<copyable_function_wrapper<F>>, no_copy>;
+
     iterator(const delayed_sequence* _parent, size_t _index)
-      : parent(_parent), index(_index) { }
-   
+      : parent(_parent), index(_index) {
+      if constexpr (copies_f) fcopy.emplace(_parent->f);
+    }
+
+    const auto& fn() const {
+      if constexpr (copies_f) return *fcopy;
+      else return parent->f;
+    }
+
     const delayed_sequence<T, V, F>* parent;
     size_t index;
+    [[no_unique_address]] f_copy fcopy;
   };
   
   // ----------- Constructors and Factories ---------------

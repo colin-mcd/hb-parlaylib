@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <ctime>
 #ifdef SPORK_HEARTBEAT_TIMING
@@ -26,7 +27,11 @@
 #include <vector>
 
 #define USE_SIGNAL_SAFE_ATOMIC
-#define RECORD_HEARTBEAT_STATS
+// -DRECORD_HEARTBEAT_STATS counts each worker's beats, acted on or missed, in
+// num_heartbeats and missed_heartbeats.  Off by default: the counters sit side
+// by side in one array, so every beat wrote a cache line shared with 15 other
+// workers, which cost the handler about 110 ns a beat at 80 threads, and
+// nothing reads them (SPORK_HEARTBEAT_TIMING counts beats per thread).
 
 namespace parlay {
   template <typename Job>
@@ -41,8 +46,13 @@ namespace spork {
   // simulated heartbeat interval is HEARTBEAT_INTERVAL_US/HEARTBEAT_COARSENING_FACTOR,
   // but with exponential work overhead as HEARTBEAT_COARSENING_FACTOR increases
   inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 250;
-  inline constexpr unsigned int HEARTBEAT_COARSENING_FACTOR = 6;
-  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = (1 << HEARTBEAT_COARSENING_FACTOR) - 1;
+  // -DSPORK_HEARTBEAT_COARSENING_FACTOR=C sets it for an experiment.
+#ifdef SPORK_HEARTBEAT_COARSENING_FACTOR
+  inline constexpr unsigned int HEARTBEAT_COARSENING_FACTOR = SPORK_HEARTBEAT_COARSENING_FACTOR;
+#else
+  inline constexpr unsigned int HEARTBEAT_COARSENING_FACTOR = 5;
+#endif
+  inline constexpr unsigned int TOKENS_PER_HEARTBEAT = (1 << (1 + HEARTBEAT_COARSENING_FACTOR)) - 1;
   // The tokens the running computation may spend on promotions, never more
   // than TOKEN_LIMIT (below), and when it last converted its time into
   // tokens (task_mark, below):
@@ -109,6 +119,16 @@ namespace spork {
   }
   inline constexpr std::uint64_t HEARTBEAT_INTERVAL_NS = std::uint64_t{HEARTBEAT_INTERVAL_US} * 1000u;
   static_assert(HEARTBEAT_INTERVAL_NS < 1000000000u, "the timer is set through tv_nsec alone");
+  // With SPORK_NO_CLOCK, time is never converted into tokens or back: there
+  // are no clocks or marks.  Each beat acted on brings TOKENS_PER_HEARTBEAT
+  // tokens (up to TOKEN_LIMIT), and a join's continuation gets the two
+  // sides' balances summed (up to TOKEN_LIMIT), on whatever timer its thread
+  // has.  The timers run free as always.
+#ifdef SPORK_NO_CLOCK
+  inline constexpr bool NO_CLOCK = true;
+#else
+  inline constexpr bool NO_CLOCK = false;
+#endif
   // The running computation's mark: saved and restored with its tokens.  Its
   // credit clock, now - mark, is the proofs' phase - base: the time it has
   // run and not yet converted into tokens.
@@ -117,10 +137,12 @@ namespace spork {
   // a computation on a different thread, so the thread-local is addressed
   // afresh on every call.
   PARLAY_NOINLINE inline std::uint64_t task_elapsed() noexcept {
+    if constexpr (NO_CLOCK) return 0;
     return monotonic_ns() - task_mark;
   }
   // The same, also storing the time it read in `now`.
   PARLAY_NOINLINE inline std::uint64_t task_elapsed(std::uint64_t& now) noexcept {
+    if constexpr (NO_CLOCK) { now = 0; return 0; }
     now = monotonic_ns();
     return now - task_mark;
   }
@@ -134,6 +156,9 @@ namespace spork {
   // parent's clock stops when it arrives at the join.  A stolen job's clock
   // starts just before the job runs.
 #ifdef SPORK_IGNORE_HB_WORK
+#ifdef SPORK_NO_CLOCK
+#error "SPORK_IGNORE_HB_WORK keeps time off the clocks, and SPORK_NO_CLOCK has none"
+#endif
   inline constexpr bool IGNORE_HB_WORK = true;
 #else
   inline constexpr bool IGNORE_HB_WORK = false;
@@ -155,9 +180,11 @@ namespace spork {
   // installed SA_NODEFER (start_heartbeats), so SIGALRM stays unblocked while
   // it runs: the thread's signal mask then never changes on the way into the
   // handler or out of it, and the kernel skips taking the process-wide signal
-  // lock for those two changes.  A beat could then interrupt the handler
-  // itself, though only one held up a whole interval; it finds this set and
-  // is dropped.
+  // lock for those two changes.  Nothing then stops the kernel from laying a
+  // beat's frame over the handler, or over a frame it has set up and not yet
+  // entered, which is why the timer is one-shot and re-armed only by the
+  // handler (arm_heartbeat).  A SIGALRM from anywhere else that lands in the
+  // handler finds this set and is dropped.
   inline constinit thread_local volatile bool in_heartbeat_handler = false;
 
 #ifdef SPORK_HEARTBEAT_TIMING
@@ -298,6 +325,10 @@ namespace spork {
   // beats disabled (join_tokens, join_tokens_running).
   inline void join_tokens_disabled(std::uint64_t c1, unsigned int t1,
                                    std::uint64_t c2, unsigned int t2, std::uint64_t now) noexcept {
+    if constexpr (NO_CLOCK) {   // the balances summed; the clocks are not kept
+      heartbeat_tokens = std::min(t1 + t2, TOKEN_LIMIT);
+      return;
+    }
     const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
     settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (c1 + c2) + N * (std::uint64_t{t1} + t2), N, now);
   }
@@ -316,7 +347,7 @@ namespace spork {
                                             std::uint64_t now = 0) noexcept {
     const bool disabled = disable_heartbeats;
     disable_heartbeats = true;
-    if (now == 0) now = monotonic_ns();
+    if (!NO_CLOCK && now == 0) now = monotonic_ns();
     join_tokens_disabled(c1, t1, c2, t2, now);
     if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (monotonic_ns() - now);   // the join's own time
     disable_heartbeats = disabled;
@@ -332,7 +363,7 @@ namespace spork {
                                                     std::uint64_t arrived = 0) noexcept {
     const bool disabled = disable_heartbeats;
     disable_heartbeats = true;
-    const std::uint64_t now = monotonic_ns();
+    const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
     const std::uint64_t c = (IGNORE_HB_WORK && arrived) ? clock_at(arrived) : now - task_mark;
     join_tokens_disabled(c_other, t_other, c, heartbeat_tokens, now);
     if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (monotonic_ns() - now);   // the join's own time
@@ -410,7 +441,7 @@ struct WorkStealingJob {
     const unsigned int enclosing = heartbeat_tokens;
     const std::uint64_t enclosing_mark = task_mark;
     heartbeat_tokens = tokens;
-    task_mark = monotonic_ns();
+    if constexpr (!NO_CLOCK) task_mark = monotonic_ns();
     thief = worker_id();   // lets a parent waiting at a pinned join steal from where the child is
     start_heartbeats();
     run();
@@ -461,10 +492,10 @@ struct WorkStealingJob {
     // arrival at the join; the job's starts now either way.
     const bool disabled = disable_heartbeats;
     disable_heartbeats = true;
-    const std::uint64_t now = monotonic_ns();
+    const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
     const std::uint64_t e1 = IGNORE_HB_WORK ? clock_at(arrived) : now - task_mark;
     const unsigned int t1 = heartbeat_tokens;
-    task_mark = now;
+    if constexpr (!NO_CLOCK) task_mark = now;
     heartbeat_tokens = tokens;
     disable_heartbeats = disabled;
     const_cast<WorkStealingJob*>(this)->run();
@@ -593,6 +624,11 @@ struct WorkStealingJob {
     explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept :
       promoted(false), promfn(fn), next(async_signal_safe_pointer<SporkSlot>::no_init_t{}) {}
 
+    // The slot whose next field p is (a sentinel or a slot).
+    static SporkSlot* of_next(async_signal_safe_pointer<SporkSlot>* p) noexcept {
+      return reinterpret_cast<SporkSlot*>(reinterpret_cast<char*>(p) - offsetof(SporkSlot, next));
+    }
+
     void link() noexcept;
     static void reset();
     bool close();
@@ -609,6 +645,13 @@ struct WorkStealingJob {
   inline constinit thread_local SporkSlot spork_deque_front{};
   inline constinit thread_local SporkSlot* spork_deque_front_p = nullptr;
   inline constinit thread_local async_signal_safe_pointer<async_signal_safe_pointer<SporkSlot>> spork_deque_back;
+  // The newest promoted slot on the list in use, or its sentinel if none is.
+  // Promotions go oldest first and are never undone, so every slot up to it
+  // is promoted and every slot after it is not: a beat starts promoting just
+  // after it.  Promotions move it forward and a promoted slot's close moves
+  // it back; linking a slot and closing an unpromoted one never touch it.
+  // Saved and restored with the back pointer.
+  inline constinit thread_local async_signal_safe_pointer<SporkSlot> spork_deque_frontier;
 
   // Make this the newest slot.  Everything its promotion reads must be set
   // first: from here on the heartbeat handler may promote it.
@@ -620,11 +663,17 @@ struct WorkStealingJob {
 
   inline void SporkSlot::reset() {
     spork_deque_back = &spork_deque_front_p->next;
+    spork_deque_frontier = spork_deque_front_p;
   }
 
   inline bool SporkSlot::close() {
     spork_deque_back = prev;
-    return promoted;
+    if (!promoted) [[likely]] return false;
+    // Promoted and the newest slot, so it was the frontier: the frontier
+    // moves back to the slot before it.  A beat that comes in between finds
+    // the frontier already unlinked (promote_front).
+    spork_deque_frontier = of_next(prev);
+    return true;
   }
 
   inline void SporkSlot::promote() {
@@ -637,12 +686,15 @@ struct WorkStealingJob {
   }
 
   inline void SporkSlot::promote_front() {
-    if (&spork_deque_front_p->next == spork_deque_back) return;
-    SporkSlot* slot = spork_deque_front_p->next.load();
-    while (heartbeat_tokens) {
-      if (!slot->promoted) slot->promote();
-      if (&slot->next == spork_deque_back) break;
+    SporkSlot* slot = spork_deque_frontier.load();
+    async_signal_safe_pointer<SporkSlot>* const back = spork_deque_back.load();
+    // The frontier's close has unlinked it but not yet moved the frontier
+    // back: it was the newest slot, so every slot left is promoted.
+    if (slot->prev == back) return;
+    while (heartbeat_tokens && &slot->next != back) {
       slot = slot->next.load();
+      slot->promote();
+      spork_deque_frontier = slot;
     }
   }
 
@@ -659,6 +711,7 @@ struct WorkStealingJob {
     Fiber* next_free;
     // This stack's computation state while it is not running.
     async_signal_safe_pointer<SporkSlot>* saved_back;
+    SporkSlot* saved_frontier;
     unsigned int saved_tokens;
     std::uint64_t saved_mark;
     bool saved_disable;
@@ -754,6 +807,7 @@ struct WorkStealingJob {
     current_fiber = f;
     spork_deque_front_p = &f->deque_front;
     spork_deque_back = f->saved_back;
+    spork_deque_frontier = f->saved_frontier;
     heartbeat_tokens = f->saved_tokens;
     task_mark = f->saved_mark;
     disable_heartbeats = f->saved_disable;
@@ -761,6 +815,7 @@ struct WorkStealingJob {
 
   inline void fiber_save(Fiber* f) noexcept {
     f->saved_back = spork_deque_back.load();
+    f->saved_frontier = spork_deque_frontier.load();
     f->saved_tokens = heartbeat_tokens;
     f->saved_mark = task_mark;
     f->saved_disable = disable_heartbeats;
@@ -784,8 +839,9 @@ struct WorkStealingJob {
     f->deque_front.promoted = true;
     f->deque_front.next.store(nullptr);
     f->saved_back = &f->deque_front.next;
+    f->saved_frontier = &f->deque_front;
     f->saved_tokens = job->tokens;
-    f->saved_mark = monotonic_ns();   // a right side's mark is when it starts
+    f->saved_mark = NO_CLOCK ? 0 : monotonic_ns();   // a right side's mark is when it starts
     f->saved_disable = false;
     fiber_install(f);
     fiber_switching = false;
@@ -828,6 +884,7 @@ struct WorkStealingJob {
     // worker's idle loop, is suspended for the duration.
     SporkSlot* caller_front = spork_deque_front_p;
     auto* caller_back = spork_deque_back.load();
+    SporkSlot* caller_frontier = spork_deque_frontier.load();
     unsigned int caller_tokens = heartbeat_tokens;
     std::uint64_t caller_mark = task_mark;
     bool caller_disable = disable_heartbeats;
@@ -856,6 +913,7 @@ struct WorkStealingJob {
     current_fiber = caller_fiber;
     spork_deque_front_p = caller_front;
     spork_deque_back = caller_back;
+    spork_deque_frontier = caller_frontier;
     heartbeat_tokens = caller_tokens;
     task_mark = caller_mark;
     disable_heartbeats = caller_disable;
@@ -931,6 +989,7 @@ struct WorkStealingJob {
       std::uint64_t start = 0;
       if constexpr (IGNORE_HB_WORK) start = monotonic_ns();
       promote();
+      spork_deque_frontier = this;   // the newest slot: with tokens to spend, every older one is promoted
       // With SPORK_IGNORE_HB_WORK the promotion's time is not the
       // computation's work (beats are disabled, so the mark is ours to move).
       if constexpr (IGNORE_HB_WORK) task_mark = task_mark + (monotonic_ns() - start);
@@ -973,6 +1032,44 @@ struct WorkStealingJob {
   }
 
 
+  // ---- the heartbeat timer ----------------------------------------------------
+  // One per thread, on CLOCK_MONOTONIC, signalling only that thread.  It is
+  // one-shot: start_heartbeats arms it, and then each beat's handler re-arms
+  // it as its last step.  A periodic timer is re-armed by the kernel as it
+  // dequeues each signal, before the frame is even built, so with the
+  // handler SA_NODEFER the next beat is laid over the last one whenever
+  // delivering a signal takes longer than the interval.  With many threads
+  // and short intervals it does: every signal takes the process-wide signal
+  // lock three times (queueing it, dequeueing it, and again after re-arming
+  // the timer), and on the Xeon 8380 with 80 threads at 25 us beats, 80% of
+  // all cycles were spent spinning on that lock.  Frames of 3.3 KB (the
+  // AVX-512 state), none of which had run an instruction of the handler,
+  // stacked 2,518 deep and overflowed an 8 MB fiber stack (fib, 80 threads,
+  // 10 us).  Re-armed by its handler, a timer cannot come due while its last
+  // beat is still being delivered, and the kernel takes the lock twice a
+  // beat, not three times, as it no longer re-arms the timer.
+  inline constinit thread_local timer_t heartbeat_timer;
+  inline constinit thread_local volatile bool heartbeat_timer_live = false;
+  // This thread's beats fall at this offset into each interval (start_heartbeats).
+  inline constinit thread_local std::uint64_t heartbeat_phase = 0;
+  inline constinit itimerspec heartbeat_its_zero = {};
+
+  // Arm this thread's timer for the first point of its grid, phase + k * N
+  // for whole k, at least N / 2 from now.  Normally that is the next one; a
+  // beat delivered more than N / 2 late skips one, so that whatever the
+  // signals cost, the computation runs for at least half an interval
+  // between beats.
+  inline void arm_heartbeat() noexcept {
+    const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
+    const std::uint64_t now = monotonic_ns();
+    std::uint64_t next = now - (now - heartbeat_phase) % N + N;
+    if (next - now < N / 2) next += N;
+    itimerspec its = {};   // no it_interval: one-shot
+    its.it_value.tv_sec = static_cast<time_t>(next / 1000000000u);
+    its.it_value.tv_nsec = static_cast<long>(next % 1000000000u);
+    timer_settime(heartbeat_timer, TIMER_ABSTIME, &its, nullptr);
+  }
+
   inline void heartbeat_handler(int sig) {
 #ifdef SPORK_HEARTBEAT_TIMING
     const std::uint64_t timing_start = __rdtsc();
@@ -982,7 +1079,7 @@ struct WorkStealingJob {
     in_heartbeat_handler = true;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     int saved_errno = errno;
-    const std::uint64_t now = monotonic_ns();
+    const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
     // fiber_switching covers the window in which the thread-local view of the
     // computation (deque pointers, tokens) does not match the stack it is
     // about to run on.  A beat lost there is harmless; promoting from the
@@ -998,9 +1095,14 @@ struct WorkStealingJob {
       // reaching back past this beat, and a beat that converts nothing leaves
       // the mark alone; at the cap the rest is dropped.  A clock of at least N,
       // from a late or missed beat, is worth TOKENS_PER_HEARTBEAT tokens by
-      // itself, so by default it reaches the cap.
-      const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
-      settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
+      // itself, so by default it reaches the cap.  With SPORK_NO_CLOCK a beat
+      // just brings TOKENS_PER_HEARTBEAT tokens, up to the cap.
+      if constexpr (NO_CLOCK) {
+        heartbeat_tokens = std::min(heartbeat_tokens + TOKENS_PER_HEARTBEAT, TOKEN_LIMIT);
+      } else {
+        const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
+        settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
+      }
 #ifdef SPORK_HEARTBEAT_TIMING
       const std::uint64_t promotions_before = heartbeat_timing_mine ? heartbeat_timing_mine->promotions : 0;
 #endif
@@ -1024,6 +1126,11 @@ struct WorkStealingJob {
       mhbs = mhbs + 1;
 #endif
     }
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    in_heartbeat_handler = false;
+    // The next beat can come due from here on, so nothing but bookkeeping
+    // follows.  A timer stopped for good (stop_heartbeats) stays stopped.
+    if (heartbeat_timer_live) arm_heartbeat();
 #ifdef SPORK_HEARTBEAT_TIMING
     if (HeartbeatTiming* t = heartbeat_timing_mine) {
       const std::uint64_t d = __rdtsc() - timing_start;
@@ -1037,22 +1144,7 @@ struct WorkStealingJob {
     }
 #endif
     errno = saved_errno;
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    in_heartbeat_handler = false;
   }
-
-  inline constinit thread_local timer_t heartbeat_timer;
-  inline constinit thread_local bool heartbeat_timer_live = false;
-  inline constinit itimerspec heartbeat_its_zero = {};
-
-  consteval itimerspec init_heartbeat_its() {
-    itimerspec its = {};
-    its.it_value   .tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
-    its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
-    return its;
-  }
-  inline constinit itimerspec heartbeat_its = init_heartbeat_its();
-
 
 inline void start_heartbeats() noexcept {
   constinit static thread_local bool thread_initialized = false;
@@ -1072,7 +1164,7 @@ inline void start_heartbeats() noexcept {
 
     timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
     heartbeat_timer_live = true;
-    if (current_fiber == nullptr) task_mark = monotonic_ns();   // a thread's own stack starts its mark here
+    if (!NO_CLOCK && current_fiber == nullptr) task_mark = monotonic_ns();   // a thread's own stack starts its mark here
 #ifdef SPORK_HEARTBEAT_TIMING
     heartbeat_timing_register();
 #endif
@@ -1084,16 +1176,11 @@ inline void start_heartbeats() noexcept {
     // with 80 threads, 74.6 us a signal with every timer in phase, 1.9 us
     // spread evenly (as with one thread).  Armed relative to now instead, a
     // thread's phase is wherever it started its first job, and the workers
-    // all start their first jobs at about the same time.
+    // all start their first jobs at about the same time.  Each beat's
+    // handler re-arms the timer on the same grid (arm_heartbeat).
     const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
-    const std::uint64_t phase = (N * WorkStealingJob::worker_id() / WorkStealingJob::num_workers()) % N;
-    const std::uint64_t now = monotonic_ns();
-    std::uint64_t first = now - now % N + phase;
-    if (first <= now) first += N;
-    itimerspec its = heartbeat_its;   // the interval
-    its.it_value.tv_sec = static_cast<time_t>(first / 1000000000u);
-    its.it_value.tv_nsec = static_cast<long>(first % 1000000000u);
-    timer_settime(heartbeat_timer, TIMER_ABSTIME, &its, nullptr);
+    heartbeat_phase = (N * WorkStealingJob::worker_id() / WorkStealingJob::num_workers()) % N;
+    arm_heartbeat();
   }
 
 #ifdef SPORK_HEARTBEAT_TIMING
@@ -1112,9 +1199,10 @@ inline void start_heartbeats() noexcept {
 inline void stop_heartbeats() noexcept {
   heartbeats_idle = true;
   if (heartbeat_timer_live) {
+    heartbeat_timer_live = false;   // first: a beat landing below must not re-arm the timer
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
     timer_delete(heartbeat_timer);
-    heartbeat_timer_live = false;
   }
 }
 

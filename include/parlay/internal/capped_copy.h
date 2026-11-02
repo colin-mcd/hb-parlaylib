@@ -36,10 +36,15 @@ struct capped_copy<T, false> {
   T& operator()() const noexcept { return *ref; }
 };
 
+// Whether cap<copy_cap> copies a T: copying is free when T is trivially
+// copyable and at most copy_cap bytes.
+template <typename T, size_t copy_cap>
+inline constexpr bool cap_copies_v =
+    std::is_trivially_copyable_v<std::remove_cv_t<T>> && sizeof(T) <= copy_cap;
+
 template <size_t copy_cap = 16, typename T>
 constexpr auto cap(T& x) noexcept {
-  using U = std::remove_cv_t<T>;
-  if constexpr (std::is_trivially_copyable_v<U> && sizeof(U) <= copy_cap)
+  if constexpr (cap_copies_v<T, copy_cap>)
     return capped_copy<T, true>{x};
   else
     return capped_copy<T, false>{std::addressof(x)};
@@ -49,6 +54,12 @@ constexpr auto cap(T& x) noexcept {
 // bodies that capture by reference are a few pointers; each wrapper level
 // adds its own few words around the body it holds.
 inline constexpr size_t functor_copy_cap = 128;
+
+// The cap for the function of a delayed sequence, which each of its iterators
+// copies (see delayed_sequence::iterator).  A loop can keep only a few words
+// in registers, and iterators are copied far more often than loop bodies, so
+// this cap is lower than functor_copy_cap.
+inline constexpr size_t delayed_function_copy_cap = 8 * sizeof(void*);
 
 // Caps a loop body f that is called with Args.  A body that cannot be called
 // as const (a mutable lambda) is referenced, since a copy would be read

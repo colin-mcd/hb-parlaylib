@@ -3,8 +3,10 @@
 #define PARLAY_SCHEDULER_H_
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 
 #include <algorithm>
 #include <atomic>
@@ -324,9 +326,26 @@ struct scheduler {
         Job* job = try_steal(id);
         if (job) return job;
       }
-      std::this_thread::sleep_for(std::chrono::nanoseconds(num_deques * 100));
+      sleep_ns(num_deques * 100);
     } while (!timeout || std::chrono::steady_clock::now() - start_time < STEAL_TIMEOUT);
     return nullptr;
+  }
+
+  // Sleep for d nanoseconds, as std::this_thread::sleep_for would, but to a
+  // fixed deadline.  When a heartbeat interrupts sleep_for, libc++ sleeps
+  // again for the time the kernel reports left, which Linux counts to the
+  // deadline plus the thread's timer slack (50 us by default).  Beats at least
+  // that frequent then push the end of the sleep out further on every beat,
+  // and it never ends: at 10 us beats with 8 threads, a worker's 800 ns pause
+  // had grown to 80 s, the worker never saw finished(), and the program hung
+  // at exit (or a pinned join never saw its job done).
+  static void sleep_ns(std::uint64_t d) {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    const std::uint64_t until = static_cast<std::uint64_t>(t.tv_sec) * 1000000000u + static_cast<std::uint64_t>(t.tv_nsec) + d;
+    t.tv_sec = static_cast<time_t>(until / 1000000000u);
+    t.tv_nsec = static_cast<long>(until % 1000000000u);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, nullptr) == EINTR) {}
   }
 
   // Up to join_thief_tries() attempts on the deque of the worker running
