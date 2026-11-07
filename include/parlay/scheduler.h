@@ -81,7 +81,7 @@ struct scheduler {
   using worker_id_type = unsigned int;
 
  private:
-  static_assert(std::is_invocable_r_v<void, Job&>);
+  // Jobs are run by spork::run_job, never called, so Job needs no operator().
 
   struct workerInfo {
     static constexpr worker_id_type UNINITIALIZED = std::numeric_limits<worker_id_type>::max();
@@ -358,7 +358,7 @@ struct scheduler {
     const auto delay = std::chrono::nanoseconds(spork::join_thief_delay_ns());
     for (unsigned int k = 0; k < tries; k++) {
       if (break_early()) return nullptr;
-      const unsigned int t = awaited->thief;
+      const unsigned int t = awaited->thief.load(std::memory_order_relaxed);
       if (t != spork::NO_THIEF && t < static_cast<unsigned int>(num_deques) && t != id) {
         auto [job, empty] = deques[t].pop_top();
 #if PARLAY_ELASTIC_PARALLELISM
