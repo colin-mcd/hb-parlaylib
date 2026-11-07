@@ -51,10 +51,13 @@ struct pool_allocator {
   size_t num_small;
   size_t max_small;
   size_t max_size;
-  std::atomic<size_t> large_allocated{0};
+  // large_allocated and large_used are statistics written by large
+  // allocations and frees; the alignas keep them on their own 128-byte line
+  // pair, away from the fields every small allocation reads.
+  alignas(128) std::atomic<size_t> large_allocated{0};
   std::atomic<size_t> large_used{0};
 
-  std::unique_ptr<size_t[]> sizes;
+  alignas(128) std::unique_ptr<size_t[]> sizes;
   std::unique_ptr<internal::hazptr_stack<void*>[]> large_buckets;
   unique_array<block_allocator> small_allocators;
 

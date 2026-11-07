@@ -27,7 +27,8 @@
 #include <cstddef>
 
 #include <iterator>
-#include <optional>
+#include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -107,7 +108,7 @@ class delayed_sequence {
 
     // Forward iteration
     iterator& operator++() {
-      assert(index < parent->last);
+      assert(index < last_index());
       index++;
       return *this;
     }
@@ -127,7 +128,7 @@ class delayed_sequence {
     // ---- Requirements for input iterator ----
 
     iterator operator++(int) {
-      assert(index < parent->last);
+      assert(index < last_index());
       auto tmp = *this;
       index++;
       return tmp;
@@ -145,18 +146,18 @@ class delayed_sequence {
 
     // Value-initialized (default constructed) iterators should
     // compare equal, but should not be dereferenced or incremented
-    iterator() : parent(nullptr), index(0) {}
+    iterator() : link(), index(0) {}
 
     // ---- Requirements for bidirectional iterator ----
 
     iterator& operator--() {
-      assert(index > parent->first);
+      assert(index > first_index());
       index--;
       return *this;
     }
 
     iterator operator--(int) {
-      assert(index > parent->first);
+      assert(index > first_index());
       auto tmp = *this;
       index--;
       return tmp;
@@ -181,26 +182,26 @@ class delayed_sequence {
     }
 
     iterator& operator+=(size_t delta) {
-      assert(index + delta <= parent->last);
+      assert(index + delta <= last_index());
       index += delta;
       return *this;
     }
 
     iterator operator+(size_t delta) const {
-      assert(index + delta <= parent->last);
+      assert(index + delta <= last_index());
       auto tmp = *this;
       tmp.index += delta;
       return tmp;
     }
 
     iterator& operator-=(size_t delta) {
-      assert(index - delta >= parent->first);
+      assert(index - delta >= first_index());
       index -= delta;
       return *this;
     }
 
     iterator operator-(size_t delta) const {
-      assert(index - delta >= parent->first);
+      assert(index - delta >= first_index());
       auto tmp = *this;
       tmp.index -= delta;
       return tmp;
@@ -229,20 +230,48 @@ class delayed_sequence {
     // Called through parent, they would be reloaded after every store that
     // may alias them, such as any store of a char.
     static constexpr bool copies_f = internal::cap_copies_v<F, internal::delayed_function_copy_cap>;
+
+    // An iterator that copies the function keeps nothing of its sequence but
+    // the copy: a pointer to the sequence would keep the sequence in memory,
+    // and each 16-byte load of the copy would then wait on the two 8-byte
+    // stores of the sequence's fields it overlaps (4 stalls per row with a
+    // short sequence per row of a sparse matrix), and a copy of its bounds
+    // would cost two more stores per iterator.  So its asserts check only
+    // what any index can be.  The copy is F's bytes (F is trivially
+    // copyable), so a default-constructed iterator, which has no function,
+    // needs no flag saying so.
+    struct no_link {};
+    struct f_bytes { alignas(F) unsigned char bytes[sizeof(F)]; };
     struct no_copy {};
-    using f_copy = std::conditional_t<copies_f, std::optional<copyable_function_wrapper<F>>, no_copy>;
+    using link_t = std::conditional_t<copies_f, no_link, const delayed_sequence*>;
+    using f_copy = std::conditional_t<copies_f, f_bytes, no_copy>;
 
     iterator(const delayed_sequence* _parent, size_t _index)
-      : parent(_parent), index(_index) {
-      if constexpr (copies_f) fcopy.emplace(_parent->f);
+      : link(link_to(_parent)), index(_index) {
+      if constexpr (copies_f) ::new (static_cast<void*>(fcopy.bytes)) F(*_parent->f.get());
+    }
+
+    static link_t link_to(const delayed_sequence* s) {
+      if constexpr (copies_f) return no_link{};
+      else return s;
     }
 
     const auto& fn() const {
-      if constexpr (copies_f) return *fcopy;
-      else return parent->f;
+      if constexpr (copies_f) return *std::launder(reinterpret_cast<const F*>(fcopy.bytes));
+      else return link->f;
     }
 
-    const delayed_sequence<T, V, F>* parent;
+    size_t first_index() const {
+      if constexpr (copies_f) return 0;
+      else return link->first;
+    }
+
+    size_t last_index() const {
+      if constexpr (copies_f) return std::numeric_limits<size_t>::max();
+      else return link->last;
+    }
+
+    [[no_unique_address]] link_t link;
     size_t index;
     [[no_unique_address]] f_copy fcopy;
   };

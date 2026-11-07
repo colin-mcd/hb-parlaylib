@@ -26,7 +26,6 @@
 #include <utility>
 #include <vector>
 
-#define USE_SIGNAL_SAFE_ATOMIC
 // -DRECORD_HEARTBEAT_STATS counts each worker's beats, acted on or missed, in
 // num_heartbeats and missed_heartbeats.  Off by default: the counters sit side
 // by side in one array, so every beat wrote a cache line shared with 15 other
@@ -45,7 +44,12 @@ namespace spork {
 
   // simulated heartbeat interval is HEARTBEAT_INTERVAL_US/HEARTBEAT_COARSENING_FACTOR,
   // but with exponential work overhead as HEARTBEAT_COARSENING_FACTOR increases
+  // -DSPORK_HEARTBEAT_INTERVAL_US=N sets it for an experiment.
+#ifdef SPORK_HEARTBEAT_INTERVAL_US
+  inline constexpr unsigned int HEARTBEAT_INTERVAL_US = SPORK_HEARTBEAT_INTERVAL_US;
+#else
   inline constexpr unsigned int HEARTBEAT_INTERVAL_US = 250;
+#endif
   // -DSPORK_HEARTBEAT_COARSENING_FACTOR=C sets it for an experiment.
 #ifdef SPORK_HEARTBEAT_COARSENING_FACTOR
   inline constexpr unsigned int HEARTBEAT_COARSENING_FACTOR = SPORK_HEARTBEAT_COARSENING_FACTOR;
@@ -570,33 +574,14 @@ struct WorkStealingJob {
 
     inline explicit async_signal_safe_pointer(no_init_t) noexcept {}
 
-    inline async_signal_safe_pointer(T* p) noexcept {
+    // Not copyable: a copy would bypass load and store.
+    async_signal_safe_pointer(const async_signal_safe_pointer&) = delete;
+    async_signal_safe_pointer& operator=(const async_signal_safe_pointer&) = delete;
+
+    // x = p is x.store(p).
+    inline async_signal_safe_pointer& operator=(T* p) noexcept {
       store(p);
-    }
-
-    inline T& operator*() {
-      return *load();
-    }
-
-    inline const T& operator*() const {
-      return *load();
-    }
-
-    inline T* operator->() noexcept {
-      return load();
-    }
-
-    inline const T* operator->() const noexcept {
-      return load();
-    }
-
-    inline async_signal_safe_pointer<T>& operator=(async_signal_safe_pointer<T>&& other) noexcept {
-      store(other.load());
       return *this;
-    }
-
-    inline bool operator==(async_signal_safe_pointer<T>&& other) const noexcept {
-      return load() == other.load();
     }
   };
 
