@@ -568,10 +568,10 @@ struct WorkStealingJob {
     // what the slot belongs to, rather than a closure object: pushing a slot
     // writes one pointer for it.
     void (*promfn)(SporkSlot*);
-    async_signal_safe_pointer<SporkSlot>* prev;
+    SporkSlot* prev;   // the next older slot, or the list's sentinel
     // The next newer slot, if any.  Left unwritten until that slot links in:
-    // promote_front reads it only after checking spork_deque_back, which is
-    // this very field until then.
+    // promote_front reads it only for slots older than spork_deque_back,
+    // which is this slot until then.
     async_signal_safe_pointer<SporkSlot> next;
 
     // A list's sentinel (spork_deque_front, Fiber::deque_front).
@@ -583,13 +583,7 @@ struct WorkStealingJob {
     explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept :
       promoted(false), promfn(fn), next(async_signal_safe_pointer<SporkSlot>::no_init_t{}) {}
 
-    // The slot whose next field p is (a sentinel or a slot).
-    static SporkSlot* of_next(async_signal_safe_pointer<SporkSlot>* p) noexcept {
-      return reinterpret_cast<SporkSlot*>(reinterpret_cast<char*>(p) - offsetof(SporkSlot, next));
-    }
-
     void link() noexcept;
-    static void reset();
     bool close();
     void promote();
     static void promote_front();
@@ -599,11 +593,11 @@ struct WorkStealingJob {
   // Slots live in the frames of the stack that created them, so the list
   // head belongs to that stack too: a fiber owns its own sentinel, and
   // spork_deque_front is the sentinel for a thread's own (pinned) stack.
-  // spork_deque_front_p names whichever is in use on this thread right now,
-  // and both it and the back pointer are saved and restored across a handoff.
+  // spork_deque_back is the newest slot on the list in use on this thread
+  // (its sentinel if the list is empty, null until spork_thread_init); it and
+  // the frontier are saved and restored across a handoff.
   inline constinit thread_local SporkSlot spork_deque_front{};
-  inline constinit thread_local SporkSlot* spork_deque_front_p = nullptr;
-  inline constinit thread_local async_signal_safe_pointer<async_signal_safe_pointer<SporkSlot>> spork_deque_back;
+  inline constinit thread_local async_signal_safe_pointer<SporkSlot> spork_deque_back;
   // The newest promoted slot on the list in use, or its sentinel if none is.
   // Promotions go oldest first and are never undone, so every slot up to it
   // is promoted and every slot after it is not: a beat starts promoting just
@@ -616,13 +610,8 @@ struct WorkStealingJob {
   // first: from here on the heartbeat handler may promote it.
   inline void SporkSlot::link() noexcept {
     prev = spork_deque_back.load();
-    *prev = this;
-    spork_deque_back = &next;
-  }
-
-  inline void SporkSlot::reset() {
-    spork_deque_back = &spork_deque_front_p->next;
-    spork_deque_frontier = spork_deque_front_p;
+    prev->next = this;
+    spork_deque_back = this;
   }
 
   inline bool SporkSlot::close() {
@@ -631,7 +620,7 @@ struct WorkStealingJob {
     // Promoted and the newest slot, so it was the frontier: the frontier
     // moves back to the slot before it.  A beat that comes in between finds
     // the frontier already unlinked (promote_front).
-    spork_deque_frontier = of_next(prev);
+    spork_deque_frontier = prev;
     return true;
   }
 
@@ -646,11 +635,11 @@ struct WorkStealingJob {
 
   inline void SporkSlot::promote_front() {
     SporkSlot* slot = spork_deque_frontier.load();
-    async_signal_safe_pointer<SporkSlot>* const back = spork_deque_back.load();
+    SporkSlot* const back = spork_deque_back.load();
     // The frontier's close has unlinked it but not yet moved the frontier
     // back: it was the newest slot, so every slot left is promoted.
     if (slot->prev == back) return;
-    while (heartbeat_tokens && &slot->next != back) {
+    while (heartbeat_tokens && slot != back) {
       slot = slot->next.load();
       slot->promote();
       spork_deque_frontier = slot;
@@ -669,7 +658,7 @@ struct WorkStealingJob {
     WorkStealingJob* job;
     Fiber* next_free;
     // This stack's computation state while it is not running.
-    async_signal_safe_pointer<SporkSlot>* saved_back;
+    SporkSlot* saved_back;
     SporkSlot* saved_frontier;
     unsigned int saved_tokens;
     std::uint64_t saved_mark;
@@ -755,16 +744,15 @@ struct WorkStealingJob {
 
   // A thread's own stack gets an empty spork deque of its own.
   inline void spork_thread_init() noexcept {
-    if (spork_deque_front_p == nullptr) {
-      spork_deque_front_p = &spork_deque_front;
-      SporkSlot::reset();
+    if (spork_deque_back.load() == nullptr) {
+      spork_deque_back = &spork_deque_front;
+      spork_deque_frontier = &spork_deque_front;
     }
   }
 
   // Make f's computation the one this thread is running.
   inline void fiber_install(Fiber* f) noexcept {
     current_fiber = f;
-    spork_deque_front_p = &f->deque_front;
     spork_deque_back = f->saved_back;
     spork_deque_frontier = f->saved_frontier;
     heartbeat_tokens = f->saved_tokens;
@@ -795,9 +783,7 @@ struct WorkStealingJob {
 
   [[noreturn]] inline void fiber_body(Fiber* f) {
     WorkStealingJob* job = f->job;
-    f->deque_front.promoted = true;
-    f->deque_front.next.store(nullptr);
-    f->saved_back = &f->deque_front.next;
+    f->saved_back = &f->deque_front;
     f->saved_frontier = &f->deque_front;
     f->saved_tokens = job->tokens;
     f->saved_mark = NO_CLOCK ? 0 : monotonic_ns();   // a right side's mark is when it starts
@@ -838,7 +824,6 @@ struct WorkStealingJob {
     spork_thread_init();
     // The caller's own computation, a pinned stack waiting at a join or a
     // worker's idle loop, is suspended for the duration.
-    SporkSlot* caller_front = spork_deque_front_p;
     auto* caller_back = spork_deque_back.load();
     SporkSlot* caller_frontier = spork_deque_frontier.load();
     unsigned int caller_tokens = heartbeat_tokens;
@@ -867,7 +852,6 @@ struct WorkStealingJob {
     pause_heartbeats();
     fiber_drain();
     current_fiber = caller_fiber;
-    spork_deque_front_p = caller_front;
     spork_deque_back = caller_back;
     spork_deque_frontier = caller_frontier;
     heartbeat_tokens = caller_tokens;
