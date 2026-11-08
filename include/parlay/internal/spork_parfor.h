@@ -10,6 +10,7 @@
 #include <atomic>
 #include <bits/types/sig_atomic_t.h>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits.h>
 #include <memory>
@@ -198,7 +199,29 @@ namespace { // private
     SpwnJob& l = slot.ls.job;
     SpwnJob& r = slot.rs.job;
 
-    bool promoted = spork_slot(slot, [&, body = body] () PARLAY_ALWAYS_INLINE {
+    bool promoted = false;
+    // Whichever jobs were built are destroyed on the way out, by exception
+    // too; a no-op for trivial ones.
+    struct DestroyJobs {
+      SpwnJob& l;
+      SpwnJob& r;
+      const bool& promoted;
+      ~DestroyJobs() {
+        if (!lazy_jobs || promoted) {
+          std::destroy_at(&l);
+          std::destroy_at(&r);
+        }
+      }
+    } destroy_jobs{l, r, promoted};
+
+    // Serially, an exception from this loop's own iterations comes before
+    // l's, and l's before r's: the first one is thrown on once the jobs are
+    // joined, and any after it are dropped (as par does, which see).
+    // Handled as in par: the handlers only keep the exception, and throw_kept
+    // throws it on outside them.
+    bool threw = false;
+    union Kept { Kept() {} ~Kept() {} std::exception_ptr e; } kept;
+    const auto loop = [&, body = body] () PARLAY_ALWAYS_INLINE {
         #ifdef VOLATILE_UNROLL
         __spork_unroll_loop(&unroll_site);
         #endif
@@ -207,20 +230,40 @@ namespace { // private
           ++i;
           sig_safe_i = static_cast<sig_atomic_t>(i);
         }
-      });
-    if (promoted) [[unlikely]] {
-      if (l.i < l.j) [[likely]] {
-        l.sync();
-        a = binop(a, l.a);
-      }
-      if (r.i < r.j) [[likely]] {
-        r.sync();
-        a = binop(a, r.a);
-      }
+      };
+    spork_open(slot);
+    SPORK_TRY {
+      loop();
+    } SPORK_CATCH_ALL {
+      ::new (&kept.e) std::exception_ptr(std::current_exception());
+      threw = true;
     }
-    if (!lazy_jobs || promoted) {   // whichever jobs were built; a no-op for trivial ones
-      std::destroy_at(&l);
-      std::destroy_at(&r);
+    if (threw) [[unlikely]] {
+      promoted = slot.close();
+      if (promoted) {
+        // Last enqueued, first joined: l, then r.
+        if (l.i < l.j) l.abandon();
+        if (r.i < r.j) r.abandon();
+      }
+      throw_kept(kept.e);   // never returns (but see throw_kept)
+      return A{};
+    } else if ((promoted = slot.close())) [[unlikely]] {
+      // No handler here: l.join() reports an exception rather than throwing
+      // it, and both jobs are joined before either result is combined, so a
+      // binop that throws leaves no job behind.  A handler on this path made
+      // LLVM keep a in memory in the loop above (classify's entropy
+      // reduction, a double: 3.7% slower at one core).
+      // (The ranges are read where they are tested, not kept across the
+      // joins in registers, which would have to be callee-saved: three more
+      // pushes and pops on every call.)
+      if (l.i < l.j && l.join()) [[unlikely]] {
+        if (r.i < r.j) r.abandon();
+        throw_kept(l.kept_exception());   // never returns (but see throw_kept)
+        return A{};
+      }
+      if (r.i < r.j) [[likely]] r.sync();
+      if (l.i < l.j) [[likely]] a = binop(a, l.a);
+      if (r.i < r.j) [[likely]] a = binop(a, r.a);
     }
     return a;
   }

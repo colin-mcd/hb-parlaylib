@@ -1,6 +1,7 @@
 #ifndef PARLAY_INTERNAL_SPORK_PAR_H_
 #define PARLAY_INTERNAL_SPORK_PAR_H_
 
+#include <exception>
 #include <new>
 #include <type_traits>
 
@@ -49,11 +50,31 @@ PARLAY_INLINE void par(const LambdaL& lamL, const LambdaR& lamR) {
     }
   } slot(lamR);
 
-  if (spork_slot(slot, lamL)) [[unlikely]] { // promoted
-    slot.storage.job.sync();
-  } else [[likely]] { // unpromoted
-    lamR();
+  // If lamL throws, its exception is the one that goes on, as it would be
+  // serially.  Handling it costs the fast path nothing: the handler is a
+  // landing pad, run only by the unwinder.  The handler only keeps the
+  // exception, and calls nothing that can throw.
+  bool left_threw = false;
+  union Kept { Kept() {} ~Kept() {} std::exception_ptr e; } kept;
+  spork_open(slot);
+  SPORK_TRY {
+    lamL();
+  } SPORK_CATCH_ALL {
+    ::new (&kept.e) std::exception_ptr(std::current_exception());
+    left_threw = true;
   }
+  if (left_threw) [[unlikely]] {
+    // Promoted, lamR's job may be running elsewhere against this frame, so
+    // it is joined (abandoned) before the exception goes on.  Not inside the
+    // handler: a join can resume this frame on another thread, and the C++
+    // runtime keeps the exceptions being handled per thread.
+    if (slot.close()) slot.storage.job.abandon();
+    throw_kept(kept.e);   // never returns (but see throw_kept)
+  } else if (slot.close()) [[unlikely]] { // promoted
+    slot.storage.job.sync();     // throws on whatever lamR threw
+    return;
+  }
+  lamR();   // unpromoted
 }
 
 } // namespace spork

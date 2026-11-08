@@ -18,6 +18,7 @@
 #ifdef SPORK_HEARTBEAT_TIMING
 #include <x86intrin.h>   // __rdtsc, for the heartbeat timing counters
 #endif
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <new>
@@ -31,6 +32,17 @@
 // by side in one array, so every beat wrote a cache line shared with 15 other
 // workers, which cost the handler about 110 ns a beat at 80 threads, and
 // nothing reads them (SPORK_HEARTBEAT_TIMING counts beats per thread).
+
+// An exception thrown by either side of a fork reaches its join, and is
+// thrown on from there (see par, parfor_ and WorkStealingJob::join).  Built
+// without exceptions, the handlers below compile to nothing.
+#if defined(__cpp_exceptions)
+#define SPORK_TRY try
+#define SPORK_CATCH_ALL catch (...)
+#else
+#define SPORK_TRY if (true)
+#define SPORK_CATCH_ALL else
+#endif
 
 namespace parlay {
   template <typename Job>
@@ -150,8 +162,12 @@ namespace spork {
   }
 
   // ---- heartbeat state --------------------------------------------------------
-  // true => this *job* must not be promoted; used during eager promotions to prevent signal-delivered heartbeats from promoting simultaneously
+  // true => beats are not acted on: the running computation is reading and
+  // rewriting its balance or mark, or promoting (see HeartbeatsDisabled)
   inline constinit thread_local volatile bool disable_heartbeats = false;
+  // true => a beat landed while disable_heartbeats was set; HeartbeatsDisabled
+  // runs it once beats are back on
+  inline constinit thread_local volatile bool heartbeat_pending = false;
   // true => this *processor* (= thread) is between jobs; not fiber state
   inline constinit thread_local volatile bool heartbeats_idle = true;
   // true => the *scheduler* is done, e.g., at end of program
@@ -166,6 +182,29 @@ namespace spork {
   // handler (arm_heartbeat).  A SIGALRM from anywhere else that lands in the
   // handler finds this set and is dropped.
   inline constinit thread_local volatile bool in_heartbeat_handler = false;
+
+  inline void run_pending_heartbeat() noexcept;
+
+  // Disables beats for its lifetime, around code that reads and rewrites the
+  // running computation's balance or mark, or promotes: a beat acted on in
+  // between would be lost or counted twice.  A beat that lands meanwhile is
+  // left pending (heartbeat_handler), and the outermost guard runs it on the
+  // way out, once beats are back on: disabling beats delays a beat by at most
+  // the guarded code, and loses none.
+  class HeartbeatsDisabled {
+    const bool outermost = !disable_heartbeats;
+   public:
+    HeartbeatsDisabled() noexcept { disable_heartbeats = true; }
+    ~HeartbeatsDisabled() {
+      if (!outermost) return;
+      disable_heartbeats = false;
+      // Check only once enabled: a beat from here on is acted on directly.
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+      while (heartbeat_pending) [[unlikely]] run_pending_heartbeat();
+    }
+    HeartbeatsDisabled(const HeartbeatsDisabled&) = delete;
+    HeartbeatsDisabled& operator=(const HeartbeatsDisabled&) = delete;
+  };
 
 #ifdef SPORK_HEARTBEAT_TIMING
   // ---- measuring what heartbeats cost (-DSPORK_HEARTBEAT_TIMING) -------------
@@ -325,11 +364,9 @@ namespace spork {
   PARLAY_NOINLINE inline void join_tokens(std::uint64_t c1, unsigned int t1,
                                             std::uint64_t c2, unsigned int t2,
                                             std::uint64_t now = 0) noexcept {
-    const bool disabled = disable_heartbeats;
-    disable_heartbeats = true;
+    const HeartbeatsDisabled beats_off;
     if (!NO_CLOCK && now == 0) now = monotonic_ns();
     join_tokens_disabled(c1, t1, c2, t2, now);
-    disable_heartbeats = disabled;
   }
 
   // A join one of whose sides is the computation running on this thread: its
@@ -338,12 +375,10 @@ namespace spork {
   // replacing them, and its conversion would then be counted twice or lost.
   // Its clock runs up to now.
   PARLAY_NOINLINE inline void join_tokens_running(std::uint64_t c_other, unsigned int t_other) noexcept {
-    const bool disabled = disable_heartbeats;
-    disable_heartbeats = true;
+    const HeartbeatsDisabled beats_off;
     const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
     const std::uint64_t c = now - task_mark;
     join_tokens_disabled(c_other, t_other, c, heartbeat_tokens, now);
-    disable_heartbeats = disabled;
   }
 
   // ---- patient stealing from the child at a pinned join ---------------------
@@ -388,6 +423,24 @@ namespace spork {
 inline void start_heartbeats() noexcept;
 inline void pause_heartbeats() noexcept;
 inline void stop_heartbeats() noexcept;
+
+// Throw on an exception kept in raw storage (WorkStealingJob::thrown, or a
+// fork's own while it joins its job), destroying the kept copy.  Every
+// exception spork carries across a join goes on from here, outside any
+// handler: a join can resume a frame on another thread, and the C++
+// runtime keeps the exceptions being handled per thread.
+//
+// It returns if the exception kept is null.  It never is, but the
+// compiler cannot know that, and so believes the handlers in par and
+// parfor_ may lead back to their normal return.  A landing pad that never
+// returns stops LLVM from shrink-wrapping the function (ShrinkWrap gives
+// up on it), and a recursive function's base case then pays the whole
+// prologue and epilogue: five more instructions per fork in fib.
+PARLAY_NOINLINE PARLAY_COLD inline void throw_kept(std::exception_ptr& kept) {
+  std::exception_ptr e = std::move(kept);
+  kept.~exception_ptr();
+  if (e) std::rethrow_exception(e);
+}
 
 struct WorkStealingJob {
   using scheduler_t = parlay::scheduler<WorkStealingJob>;
@@ -445,6 +498,7 @@ struct WorkStealingJob {
   // if need be) only on a thread that has none yet.
   void enqueue(unsigned int t) {
     tokens = t;
+    threw = false;
     handoff = handoff_possible();
     if (handoff) join_count.store(2, std::memory_order_relaxed);
     thief.store(NO_THIEF, std::memory_order_relaxed);
@@ -462,23 +516,50 @@ struct WorkStealingJob {
   // tokens it was given, as a thief would start it; and once it finishes,
   // join_tokens pools the two.
   void fast_clone() {
-    // With beats disabled, so that no beat can land between reading the
-    // parent's clock and balance and replacing them with the job's.  The
-    // parent's clock runs up to now, and the job's starts now.
-    const bool disabled = disable_heartbeats;
-    disable_heartbeats = true;
-    const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
-    const std::uint64_t e1 = now - task_mark;
-    const unsigned int t1 = heartbeat_tokens;
-    if constexpr (!NO_CLOCK) task_mark = now;
-    heartbeat_tokens = tokens;
-    disable_heartbeats = disabled;
-    const_cast<WorkStealingJob*>(this)->run();
+    std::uint64_t e1;
+    unsigned int t1;
+    {
+      // With beats disabled, so that no beat can land between reading the
+      // parent's clock and balance and replacing them with the job's.  The
+      // parent's clock runs up to now, and the job's starts now.
+      const HeartbeatsDisabled beats_off;
+      const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
+      e1 = now - task_mark;
+      t1 = heartbeat_tokens;
+      if constexpr (!NO_CLOCK) task_mark = now;
+      heartbeat_tokens = tokens;
+    }
+    // If the job throws, its exception is kept in it, as a thief would keep
+    // it (fiber_body), and the join happens all the same.
+    SPORK_TRY {
+      const_cast<WorkStealingJob*>(this)->run();
+    } SPORK_CATCH_ALL {
+      keep_exception();
+    }
     join_tokens_running(e1, t1);   // the job, still running here, is the second side
   }
 
-  // Defined below, once fibers are available.
-  void sync();
+  // join waits for the job, running it here if nobody stole it, and returns
+  // whether it threw, keeping the exception in the job; sync throws it on.
+  // abandon is the join for a parent whose own side threw first.  Defined
+  // below, once fibers are available, as is join_stolen, the part of join
+  // and abandon for a job some thief took.
+  bool join();
+  void sync() {
+    if (join()) [[unlikely]] throw_kept(kept_exception());
+  }
+  void abandon();
+  void join_stolen();
+
+  // Whoever ran a job whose run() threw keeps the exception in the job
+  // (fiber_body, fast_clone).
+  PARLAY_NOINLINE PARLAY_COLD void keep_exception() noexcept {
+    ::new (static_cast<void*>(thrown)) std::exception_ptr(std::current_exception());
+    threw = true;
+  }
+  std::exception_ptr& kept_exception() noexcept {
+    return *std::launder(reinterpret_cast<std::exception_ptr*>(thrown));
+  }
 
   // bool sync_is_stolen() {
   //   if (!try_dequeue()) {
@@ -512,6 +593,10 @@ struct WorkStealingJob {
   // thread's own stack, keep the older discipline: the parent waits and the
   // parent resumes.
   bool handoff;
+  // Whether run() threw, in which case whoever ran it left the exception in
+  // `thrown` for the parent (join reports it, sync throws it on, abandon
+  // drops it).  Set by enqueue.
+  bool threw;
   // Counts down from two: the parent arriving at the join and the thief
   // finishing the job each decrement it once.  Whichever decrement reads one
   // belongs to the second arriver, who continues the parent's continuation.
@@ -519,6 +604,9 @@ struct WorkStealingJob {
   // The parent's continuation.  It exists only once the parent has left that
   // stack, because an fcontext handle is produced by the jump that vacates it.
   fcontext_t parent_ctx;
+  // A std::exception_ptr once threw is set, in raw storage, so that a job
+  // stays trivially destructible.
+  alignas(std::exception_ptr) unsigned char thrown[sizeof(std::exception_ptr)];
 };
 
   template <typename T>
@@ -526,13 +614,9 @@ struct WorkStealingJob {
     static_assert(__atomic_always_lock_free(sizeof(T*), 0),
                   "async_signal_safe_pointer relies on being always lock free!");
     private:
-    // Accessed only atomically (relaxed, behind signal fences), but a plain
-    // pointer rather than a std::atomic, which C++20 always initializes: a
-    // spork slot's next is left unwritten (no_init) until it is needed.
+    // Accessed only atomically: relaxed, behind signal fences.
     T* ptr;
     public:
-    struct no_init_t {};
-
     inline void store(T* p) noexcept {
       std::atomic_signal_fence(std::memory_order_release);
       __atomic_store_n(&ptr, p, __ATOMIC_RELAXED);
@@ -546,8 +630,6 @@ struct WorkStealingJob {
 
     inline constexpr async_signal_safe_pointer() noexcept : ptr(nullptr) {}
 
-    inline explicit async_signal_safe_pointer(no_init_t) noexcept {}
-
     // Not copyable: a copy would bypass load and store.
     async_signal_safe_pointer(const async_signal_safe_pointer&) = delete;
     async_signal_safe_pointer& operator=(const async_signal_safe_pointer&) = delete;
@@ -560,10 +642,12 @@ struct WorkStealingJob {
   };
 
   // A promotable fork: pushed onto its stack's list for the duration of the
-  // fork's left side (spork_slot), oldest first.  The fork that owns it
-  // derives from it, with whatever its promotion needs (see spork and par).
+  // fork's left side (spork_open, then close), oldest first.  The fork that
+  // owns it derives from it, with whatever its promotion needs (see spork
+  // and par).
+  // A slot has no promoted flag: it is promoted exactly when it is the
+  // frontier or older (see spork_deque_frontier).
   struct SporkSlot {
-    volatile bool promoted; // TODO: change this to an integer, record the stealing thread? or maybe needs to be separate
     // The promotion, called with this slot.  A plain function, which knows
     // what the slot belongs to, rather than a closure object: pushing a slot
     // writes one pointer for it.
@@ -571,17 +655,18 @@ struct WorkStealingJob {
     SporkSlot* prev;   // the next older slot, or the list's sentinel
     // The next newer slot, if any.  Left unwritten until that slot links in:
     // promote_front reads it only for slots older than spork_deque_back,
-    // which is this slot until then.
-    async_signal_safe_pointer<SporkSlot> next;
+    // which is this slot until then.  So, like prev, it needs no atomic
+    // access: link writes it while promote_front won't read it, and link's
+    // store to spork_deque_back (a release) publishes it.
+    SporkSlot* next;
 
     // A list's sentinel (spork_deque_front, Fiber::deque_front).
     constexpr explicit SporkSlot() :
-      promoted(true), promfn(nullptr), prev(nullptr), next(async_signal_safe_pointer<SporkSlot>()) {}
+      promfn(nullptr), prev(nullptr), next(nullptr) {}
 
-    // Not yet on the list: its owner finishes building it, and spork_slot
+    // Not yet on the list: its owner finishes building it, and spork_open
     // links it.
-    explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept :
-      promoted(false), promfn(fn), next(async_signal_safe_pointer<SporkSlot>::no_init_t{}) {}
+    explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept : promfn(fn) {}
 
     void link() noexcept;
     bool close();
@@ -602,7 +687,9 @@ struct WorkStealingJob {
   // Promotions go oldest first and are never undone, so every slot up to it
   // is promoted and every slot after it is not: a beat starts promoting just
   // after it.  Promotions move it forward and a promoted slot's close moves
-  // it back; linking a slot and closing an unpromoted one never touch it.
+  // it back; linking a slot and closing an unpromoted one never touch it.  A
+  // closing slot is the newest, so it is promoted exactly when it is the
+  // frontier.
   // Saved and restored with the back pointer.
   inline constinit thread_local async_signal_safe_pointer<SporkSlot> spork_deque_frontier;
 
@@ -615,11 +702,17 @@ struct WorkStealingJob {
   }
 
   inline bool SporkSlot::close() {
+    // This slot, the newest, read back from the list rather than kept from
+    // before the fork's left side ran: comparing against `this` keeps the
+    // slot's address in a callee-saved register across the left side.
+    SporkSlot* const self = spork_deque_back.load();
     spork_deque_back = prev;
-    if (!promoted) [[likely]] return false;
-    // Promoted and the newest slot, so it was the frontier: the frontier
-    // moves back to the slot before it.  A beat that comes in between finds
-    // the frontier already unlinked (promote_front).
+    // Read the frontier only once unlinked: read before, it could miss a beat
+    // that promotes this slot in between, whose job would never be synced.
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (spork_deque_frontier.load() != self) [[likely]] return false;
+    // Promoted: the frontier moves back to the slot before it.  A beat that
+    // comes in between finds the frontier already unlinked (promote_front).
     spork_deque_frontier = prev;
     return true;
   }
@@ -629,7 +722,6 @@ struct WorkStealingJob {
     if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->promotions, 1);
 #endif
     heartbeat_tokens = heartbeat_tokens - 1;
-    promoted = true;
     promfn(this);
   }
 
@@ -640,7 +732,7 @@ struct WorkStealingJob {
     // back: it was the newest slot, so every slot left is promoted.
     if (slot->prev == back) return;
     while (heartbeat_tokens && slot != back) {
-      slot = slot->next.load();
+      slot = slot->next;
       slot->promote();
       spork_deque_frontier = slot;
     }
@@ -651,6 +743,29 @@ struct WorkStealingJob {
   // Every job runs on a stack of its own, so that a join can suspend it.  The
   // Fiber object sits at the top of the stack it describes; the stack grows
   // down from just below it towards a guard page.
+
+  // The C++ runtime's per-thread exception state (the Itanium ABI's
+  // __cxa_eh_globals, the same in libc++abi and libstdc++ on x86-64): the
+  // exceptions being handled, innermost first, and how many have been thrown
+  // and not yet caught.  It belongs to the computation, not the thread, so
+  // each fiber carries its own across switches: a catch block that joins can
+  // resume on another thread, and its __cxa_end_catch must find its own
+  // exception there.  Declared under another name (the asm label binds it),
+  // so as not to clash with either runtime's cxxabi.h.
+  struct EhState {
+    void* caught;
+    unsigned int uncaught;
+  };
+  void* spork_cxa_get_globals() noexcept __asm__("__cxa_get_globals");
+  // noinline: a switch can resume a computation on another thread, so the
+  // runtime is asked afresh each time (libstdc++ declares __cxa_get_globals
+  // const, which would let the compiler reuse an earlier answer).
+  PARLAY_NOINLINE inline EhState eh_state_save() noexcept {
+    return *static_cast<EhState*>(spork_cxa_get_globals());
+  }
+  PARLAY_NOINLINE inline void eh_state_install(EhState e) noexcept {
+    *static_cast<EhState*>(spork_cxa_get_globals()) = e;
+  }
 
   struct Fiber {
     void* map_base;
@@ -663,6 +778,7 @@ struct WorkStealingJob {
     unsigned int saved_tokens;
     std::uint64_t saved_mark;
     bool saved_disable;
+    EhState saved_eh;
     fcontext_t entry;        // enters fiber_trampoline on this stack
     std::size_t stack_size;      // context that enters fiber_body for the first time
     SporkSlot deque_front;      // head of this stack's spork deque
@@ -758,6 +874,7 @@ struct WorkStealingJob {
     heartbeat_tokens = f->saved_tokens;
     task_mark = f->saved_mark;
     disable_heartbeats = f->saved_disable;
+    eh_state_install(f->saved_eh);
   }
 
   inline void fiber_save(Fiber* f) noexcept {
@@ -766,6 +883,7 @@ struct WorkStealingJob {
     f->saved_tokens = heartbeat_tokens;
     f->saved_mark = task_mark;
     f->saved_disable = disable_heartbeats;
+    f->saved_eh = eh_state_save();
   }
 
   // Recycle the fiber abandoned by whoever switched to us.  At most one can be
@@ -788,13 +906,20 @@ struct WorkStealingJob {
     f->saved_tokens = job->tokens;
     f->saved_mark = NO_CLOCK ? 0 : monotonic_ns();   // a right side's mark is when it starts
     f->saved_disable = false;
+    f->saved_eh = EhState{};
     fiber_install(f);
     fiber_switching = false;
     fiber_drain();
     start_heartbeats();
 
     job->thief.store(WorkStealingJob::worker_id(), std::memory_order_relaxed);
-    job->run();
+    SPORK_TRY {
+      job->run();
+    } SPORK_CATCH_ALL {
+      // Nothing beneath this frame could catch it.  The parent throws it on
+      // once joined, and the steps below publish it to the parent.
+      job->keep_exception();
+    }
 
     fiber_switching = true;
     // For the join, if we are second to it.  Written before either way of
@@ -830,6 +955,7 @@ struct WorkStealingJob {
     std::uint64_t caller_mark = task_mark;
     bool caller_disable = disable_heartbeats;
     Fiber* caller_fiber = current_fiber;
+    const EhState caller_eh = eh_state_save();
 
     Fiber* f = fiber_acquire();
     f->job = job;
@@ -857,23 +983,45 @@ struct WorkStealingJob {
     heartbeat_tokens = caller_tokens;
     task_mark = caller_mark;
     disable_heartbeats = caller_disable;
+    eh_state_install(caller_eh);
     fiber_switching = false;
   }
 
   // A job nobody stole is run here (fast_clone); at the join of a stolen one
   // the continuation's tokens and mark come from both sides (join_tokens).
-  inline void WorkStealingJob::sync() {
+  inline bool WorkStealingJob::join() {
 #ifdef SPORK_HEARTBEAT_TIMING
     HeartbeatTiming* const timing = heartbeat_timing_mine;
     if (timing) timing_add(timing->joins, 1);
 #endif
     if (try_dequeue()) {              // never stolen: run it here
       fast_clone();
-      return;
+      return threw;
     }
 #ifdef SPORK_HEARTBEAT_TIMING
     if (timing) timing_add(timing->stolen_joins, 1);
 #endif
+    join_stolen();
+    return threw;
+  }
+
+  // The parent's own side threw before the join, and its exception comes
+  // first: serially, this job would never have run.  So a job nobody stole
+  // is dropped, and its tokens go back to the parent as at the join of a job
+  // that took no time.  A stolen one is running against the parent's frame,
+  // which must outlive it, so the parent waits for it, and drops whatever it
+  // threw.
+  inline void WorkStealingJob::abandon() {
+    if (try_dequeue()) {
+      join_tokens_running(0, tokens);
+      return;
+    }
+    join_stolen();
+    if (threw) [[unlikely]] kept_exception().~exception_ptr();
+  }
+
+  // The join of a job some thief took.
+  inline void WorkStealingJob::join_stolen() {
     if (!handoff) {                   // parent's stack is pinned: wait for the child
       if (!finished()) {              // the child will be second
         pause_heartbeats();           // before reading our clock and balance: no beat may change them now
@@ -920,13 +1068,12 @@ struct WorkStealingJob {
 #ifdef SPORK_HEARTBEAT_TIMING
     const std::uint64_t timing_start = __rdtsc();
 #endif
-    bool before = disable_heartbeats;
-    disable_heartbeats = true;
-    if (heartbeat_tokens && !promoted) {
+    const HeartbeatsDisabled beats_off;
+    // A beat since link may have promoted it already, making it the frontier.
+    if (heartbeat_tokens && spork_deque_frontier.load() != this) {
       promote();
       spork_deque_frontier = this;   // the newest slot: with tokens to spend, every older one is promoted
     }
-    disable_heartbeats = before;
 #ifdef SPORK_HEARTBEAT_TIMING
     if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->eager_ticks, __rdtsc() - timing_start);
 #endif
@@ -1002,6 +1149,47 @@ struct WorkStealingJob {
     timer_settime(heartbeat_timer, TIMER_ABSTIME, &its, nullptr);
   }
 
+  // A beat's work: convert the running computation's credit into tokens,
+  // then promote with them.  Run by the handler, or by HeartbeatsDisabled for
+  // a beat that landed while beats were disabled, with no other beat acted on
+  // meanwhile either way, as settle requires.
+  inline void run_heartbeat(std::uint64_t now) noexcept {
+    // Pro-rated: settle the clock since the mark, at TOKENS_PER_HEARTBEAT
+    // tokens per interval, together with the balance.  Below the cap the
+    // remainder (under one token's worth) stays on the clock, possibly
+    // reaching back past this beat, and a beat that converts nothing leaves
+    // the mark alone; at the cap the rest is dropped.  A clock of at least N,
+    // from a late or missed beat, is worth TOKENS_PER_HEARTBEAT tokens by
+    // itself, so by default it reaches the cap.  With SPORK_NO_CLOCK a beat
+    // just brings TOKENS_PER_HEARTBEAT tokens, up to the cap.
+    if constexpr (NO_CLOCK) {
+      heartbeat_tokens = std::min(heartbeat_tokens + TOKENS_PER_HEARTBEAT, TOKEN_LIMIT);
+    } else {
+      const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
+      settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
+    }
+#ifdef SPORK_HEARTBEAT_TIMING
+    const std::uint64_t promotions_before = heartbeat_timing_mine ? heartbeat_timing_mine->promotions : 0;
+#endif
+    SporkSlot::promote_front();
+#ifdef SPORK_HEARTBEAT_TIMING
+    if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->handler_promotions, t->promotions - promotions_before);
+#endif
+  }
+
+  // A beat left pending while beats were disabled, run as they come back on
+  // (~HeartbeatsDisabled).  The flag is cleared while beats are still on, so
+  // a beat landing in between is acted on directly; one landing while this
+  // runs sets it again for the destructor's next check.  Dropped if this
+  // thread has since gone idle or begun a switch, as the handler would.
+  PARLAY_NOINLINE inline void run_pending_heartbeat() noexcept {
+    heartbeat_pending = false;
+    disable_heartbeats = true;
+    if (!heartbeats_idle && !fiber_switching) run_heartbeat(NO_CLOCK ? 0 : monotonic_ns());
+    disable_heartbeats = false;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+  }
+
   inline void heartbeat_handler(int sig) {
 #ifdef SPORK_HEARTBEAT_TIMING
     const std::uint64_t timing_start = __rdtsc();
@@ -1021,28 +1209,13 @@ struct WorkStealingJob {
       volatile unsigned int& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
       hbs = hbs + 1;
 #endif
-      // Pro-rated: settle the clock since the mark, at TOKENS_PER_HEARTBEAT
-      // tokens per interval, together with the balance.  Below the cap the
-      // remainder (under one token's worth) stays on the clock, possibly
-      // reaching back past this beat, and a beat that converts nothing leaves
-      // the mark alone; at the cap the rest is dropped.  A clock of at least N,
-      // from a late or missed beat, is worth TOKENS_PER_HEARTBEAT tokens by
-      // itself, so by default it reaches the cap.  With SPORK_NO_CLOCK a beat
-      // just brings TOKENS_PER_HEARTBEAT tokens, up to the cap.
-      if constexpr (NO_CLOCK) {
-        heartbeat_tokens = std::min(heartbeat_tokens + TOKENS_PER_HEARTBEAT, TOKEN_LIMIT);
-      } else {
-        const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
-        settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
-      }
-#ifdef SPORK_HEARTBEAT_TIMING
-      const std::uint64_t promotions_before = heartbeat_timing_mine ? heartbeat_timing_mine->promotions : 0;
-#endif
-      SporkSlot::promote_front();
-#ifdef SPORK_HEARTBEAT_TIMING
-      if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->handler_promotions, t->promotions - promotions_before);
-#endif
+      run_heartbeat(now);
     } else {
+      // With beats disabled the interrupted code is reading or rewriting the
+      // balance or the mark: leave the beat for HeartbeatsDisabled to run once
+      // they are back on.  Idle or mid-switch there is no running computation
+      // to credit, and the beat is dropped.
+      if (!heartbeats_idle && !fiber_switching) heartbeat_pending = true;
 #ifdef RECORD_HEARTBEAT_STATS
       volatile unsigned int& mhbs = missed_heartbeats[spork::WorkStealingJob::worker_id()];
       mhbs = mhbs + 1;
@@ -1136,15 +1309,24 @@ inline void pause_heartbeats() noexcept {
 #endif
 }
 
-// Run body() as the left side of a promotable fork whose slot is `slot`
-// (built, not yet linked; it is linked here, and promoted at once if this
-// computation holds tokens).  Returns whether it was promoted.
-template <typename BodyLambda>
-PARLAY_INLINE bool spork_slot(SporkSlot& slot, const BodyLambda& body) {
-  static_assert(std::is_invocable_v<const BodyLambda&>);
+// Open a promotable fork whose slot is `slot` (built, not yet linked): link
+// it, and promote it at once if this computation holds tokens.  The fork
+// then runs its left side and closes the slot, which says whether it was
+// promoted.  par and parfor_ do that themselves, as they also handle a left
+// side that throws.
+PARLAY_INLINE void spork_open(SporkSlot& slot) {
   slot.link();
   if (heartbeat_tokens) [[unlikely]]
     slot.eager_promote();
+}
+
+// Run body() as the left side of a promotable fork whose slot is `slot`.
+// Returns whether it was promoted.  body must not throw, as that would
+// leave the slot on the list.
+template <typename BodyLambda>
+PARLAY_INLINE bool spork_slot(SporkSlot& slot, const BodyLambda& body) {
+  static_assert(std::is_invocable_v<const BodyLambda&>);
+  spork_open(slot);
   body();
   return slot.close();
 }
