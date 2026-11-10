@@ -8,8 +8,9 @@
 // library (no compiler support for splitting a function at a spawn) the only
 // way to give the continuation to a different thread is to give that thread
 // the stack the continuation lives on.  This header holds the machine-level
-// half of that: context switching and a pool of lazily committed stacks.  The
-// protocol that uses them is in spork_scheduler.h.
+// half of that: context switching, lazily committed stacks, and which fiber
+// each thread is running.  The protocol that uses them is in
+// spork_handoff.h.
 //
 // Switching is Boost.Context's fcontext, vendored in fcontext.h.  A jump
 // pushes the callee-saved registers onto the stack being left and hands back
@@ -20,6 +21,7 @@
 // and x87 control words, which are callee-saved under the System V ABI.
 
 #include "fcontext.h"
+#include "spork_api.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -57,9 +59,28 @@ inline void* fiber_map_stack() {
   return base;
 }
 
-inline void fiber_unmap_stack(void* base) {
-  munmap(base, FIBER_STACK_SIZE);
-}
+// ---- which fiber this thread is running ------------------------------------
+struct Fiber;
+// The fiber this thread is currently running, or null when it is running on
+// its own stack (the main thread's, or a worker's idle loop).
+inline constinit thread_local Fiber* current_fiber = nullptr;
+// Where a fiber goes when it has nothing more to run on this thread.
+// This thread's home handle while it runs a fiber: one-shot, consumed by
+// whichever context jumps back to the idle loop.
+inline constinit thread_local fcontext_t fiber_home_ctx = nullptr;
+// A fiber abandoned by whoever last switched to us, waiting to be recycled.
+inline constinit thread_local Fiber* fiber_pending_free = nullptr;
+// A join whose counter must be decremented once we are off the stack that
+// the decrement makes available to the other arriver.
+inline constinit thread_local WorkStealingJob* fiber_post_join = nullptr;
+// Set while the thread-local view of the computation does not match the
+// stack in use.  Read by the heartbeat handler.
+inline constinit thread_local volatile bool fiber_switching = false;
+
+// Only a fiber can be handed to another thread.  A thread's own stack is
+// pinned, because the frames beneath the parallel region belong to that
+// thread: main(), or the scheduler's worker loop.
+inline bool handoff_possible() noexcept { return current_fiber != nullptr; }
 
 }  // namespace spork
 
