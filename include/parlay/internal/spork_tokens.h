@@ -99,11 +99,40 @@ static_assert(HEARTBEAT_INTERVAL_NS < 1000000000u, "the timer is set through tv_
 // tokens (up to TOKEN_LIMIT), and a join's continuation gets the two
 // sides' balances summed (up to TOKEN_LIMIT), on whatever timer its thread
 // has.  The timers run free as always.
-#ifdef SPORK_NO_CLOCK
+// SPORK_USE_MPL_HB is MPL's scheme, SPORK_NO_CLOCK's but for one rule: a
+// job found unstolen at its join is run by its parent as a plain call, on
+// the parent's own balance, and the tokens it was given are dropped
+// (fast_clone, abandon, spork_dc_parfor.h).  Only a stolen job's leftover
+// tokens come back, added to the parent's.  It implies SPORK_DC_LOOPS
+// (spork_parfor.h).
+// SPORK_USE_HBC_HB is HBC's scheme: no tokens at all.  Each beat promotes
+// the oldest fork not yet promoted, if there is one, and is lost otherwise
+// (run_heartbeat); no fork is promoted eagerly, a job starts with nothing,
+// and a join pools nothing.  The balance holds a beat's one promotion only
+// while that beat promotes, and is 0 everywhere else.  Either kind of
+// parallel loop works with it.
+#ifdef SPORK_USE_MPL_HB
+inline constexpr bool MPL_HB = true;
+#else
+inline constexpr bool MPL_HB = false;
+#endif
+#ifdef SPORK_USE_HBC_HB
+inline constexpr bool HBC_HB = true;
+#else
+inline constexpr bool HBC_HB = false;
+#endif
+#if defined(SPORK_USE_MPL_HB) && defined(SPORK_USE_HBC_HB)
+#error "SPORK_USE_MPL_HB and SPORK_USE_HBC_HB select different token schemes"
+#endif
+#if defined(SPORK_NO_CLOCK) || defined(SPORK_USE_MPL_HB) || defined(SPORK_USE_HBC_HB)
 inline constexpr bool NO_CLOCK = true;
 #else
 inline constexpr bool NO_CLOCK = false;
 #endif
+// Whether a job found unstolen at its join hands tokens back to its parent
+// (fast_clone, abandon, spork_dc_parfor.h): not under MPL's scheme, which
+// drops them, nor under HBC's, which has none.
+inline constexpr bool UNSTOLEN_JOIN_TOKENS = !MPL_HB && !HBC_HB;
 // The running computation's mark: saved and restored with its tokens.  Its
 // credit clock, now - mark, is the proofs' phase - base: the time it has
 // run and not yet converted into tokens.

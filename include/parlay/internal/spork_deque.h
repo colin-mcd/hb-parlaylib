@@ -169,10 +169,14 @@ PARLAY_NOINLINE inline void SporkSlot::eager_promote() {
 // it, and promote it at once if this computation holds tokens.  The fork
 // then runs its left side and closes the slot, which says whether it was
 // promoted (see par and parfor_, which also handle a left side that throws).
+// Under HBC's scheme (SPORK_USE_HBC_HB) the balance is 0 outside a beat, so
+// no fork is promoted eagerly, and none checks.
 PARLAY_INLINE void spork_open(SporkSlot& slot) {
   slot.link();
-  if (heartbeat_tokens) [[unlikely]]
-    slot.eager_promote();
+  if constexpr (!HBC_HB) {
+    if (heartbeat_tokens) [[unlikely]]
+      slot.eager_promote();
+  }
 }
 
 }  // namespace spork

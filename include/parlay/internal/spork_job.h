@@ -99,11 +99,14 @@ struct WorkStealingJob {
   // any other: the parent (left side) has finished, with its elapsed time
   // and balance; the job (right side) starts with a fresh mark and the
   // tokens it was given, as a thief would start it; and once it finishes,
-  // join_tokens pools the two.
+  // join_tokens pools the two.  Under MPL's scheme (SPORK_USE_MPL_HB) it is
+  // no join: the job runs as a plain call, on the parent's own balance, and
+  // its tokens are dropped.  So too under HBC's (SPORK_USE_HBC_HB), which
+  // has no tokens.
   void fast_clone() {
     std::uint64_t e1;
     unsigned int t1;
-    {
+    if constexpr (UNSTOLEN_JOIN_TOKENS) {
       // With beats disabled, so that no beat can land between reading the
       // parent's clock and balance and replacing them with the job's.  The
       // parent's clock runs up to now, and the job's starts now.
@@ -121,7 +124,8 @@ struct WorkStealingJob {
     } SPORK_CATCH_ALL {
       keep_exception();
     }
-    join_tokens_running(e1, t1);   // the job, still running here, is the second side
+    if constexpr (UNSTOLEN_JOIN_TOKENS)
+      join_tokens_running(e1, t1);   // the job, still running here, is the second side
   }
 
   // join waits for the job, running it here if nobody stole it, and returns

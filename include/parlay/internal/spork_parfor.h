@@ -1,6 +1,16 @@
 #ifndef PARLAY_INTERNAL_SPORK_PARFOR_H_
 #define PARLAY_INTERNAL_SPORK_PARFOR_H_
 
+// MPL's token scheme (-DSPORK_USE_MPL_HB, spork_tokens.h) implies
+// divide-and-conquer loops.
+#if defined(SPORK_USE_MPL_HB) && !defined(SPORK_DC_LOOPS)
+#define SPORK_DC_LOOPS
+#endif
+
+#ifdef SPORK_DC_LOOPS
+#include "spork_dc_parfor.h"
+#else
+
 #include "spork_scheduler.h"
 #include "capped_copy.h"
 #include "../monoid.h"
@@ -333,3 +343,5 @@ parlay::monoid_value_type_t<BinOp> parfor(idx n, const BodyLambda& body, const B
 } // namespace spork
 
 #endif // PARLAY_INTERNAL_SPORK_PARFOR_H_
+
+#endif // SPORK_DC_LOOPS

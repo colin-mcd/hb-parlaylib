@@ -120,9 +120,14 @@ inline void run_heartbeat(std::uint64_t now) noexcept {
   // reaching back past this beat, and a beat that converts nothing leaves
   // the mark alone; at the cap the rest is dropped.  A clock of at least N,
   // from a late or missed beat, is worth TOKENS_PER_HEARTBEAT tokens by
-  // itself, so by default it reaches the cap.  With SPORK_NO_CLOCK a beat
-  // just brings TOKENS_PER_HEARTBEAT tokens, up to the cap.
-  if constexpr (NO_CLOCK) {
+  // itself, so by default it reaches the cap.  With SPORK_NO_CLOCK (or
+  // SPORK_USE_MPL_HB) a beat just brings TOKENS_PER_HEARTBEAT tokens, up to
+  // the cap.  With SPORK_USE_HBC_HB there are no tokens: the beat promotes
+  // one fork, through a balance of 1 that it spends, and is lost if there is
+  // none to promote.
+  if constexpr (HBC_HB) {
+    heartbeat_tokens = 1;
+  } else if constexpr (NO_CLOCK) {
     heartbeat_tokens = std::min(heartbeat_tokens + TOKENS_PER_HEARTBEAT, TOKEN_LIMIT);
   } else {
     const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
@@ -135,6 +140,7 @@ inline void run_heartbeat(std::uint64_t now) noexcept {
 #ifdef SPORK_HEARTBEAT_TIMING
   if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->handler_promotions, t->promotions - promotions_before);
 #endif
+  if constexpr (HBC_HB) heartbeat_tokens = 0;
 }
 
 // A beat left pending while beats were disabled, run as they come back on

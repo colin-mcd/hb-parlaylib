@@ -302,12 +302,12 @@ inline bool WorkStealingJob::join() {
 // The parent's own side threw before the join, and its exception comes
 // first: serially, this job would never have run.  So a job nobody stole
 // is dropped, and its tokens go back to the parent as at the join of a job
-// that took no time.  A stolen one is running against the parent's frame,
-// which must outlive it, so the parent waits for it, and drops whatever it
-// threw.
+// that took no time (under MPL's scheme they are dropped with it, and HBC's
+// has none).  A stolen one is running against the parent's frame, which must
+// outlive it, so the parent waits for it, and drops whatever it threw.
 inline void WorkStealingJob::abandon() {
   if (try_dequeue()) {
-    join_tokens_running(0, tokens);
+    if constexpr (UNSTOLEN_JOIN_TOKENS) join_tokens_running(0, tokens);
     return;
   }
   join_stolen();
