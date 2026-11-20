@@ -5,8 +5,8 @@
 #include <new>
 #include <type_traits>
 
-#include "spork_scheduler.h"
-#include "../portability.h"
+#include "scheduler.h"
+#include "../../portability.h"
 
 namespace spork {
 
@@ -37,13 +37,13 @@ PARLAY_INLINE void par(const LambdaL& lamL, const LambdaR& lamR) {
   // handler, or eagerly), as parfor_ builds its jobs: most forks never are,
   // and building a job costs a vtable pointer, two flags and a reference.
   // Those are plain stores, so the handler may make them.
-  struct Slot : SporkSlot {
+  struct Slot : PromHandler {
     const LambdaR& lamR;
     union Storage { Storage() {} ~Storage() {} SpwnJob job; } storage;
 
-    explicit Slot(const LambdaR& r) noexcept : SporkSlot(&promotion), lamR(r) {}
+    explicit Slot(const LambdaR& r) noexcept : PromHandler(&promotion), lamR(r) {}
 
-    static void promotion(SporkSlot* s) {
+    static void promotion(PromHandler* s) {
       Slot& slot = *static_cast<Slot*>(s);
       ::new (&slot.storage.job) SpwnJob(slot.lamR);
       slot.storage.job.enqueue(split_tokens());

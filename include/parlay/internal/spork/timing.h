@@ -4,7 +4,7 @@
 // What heartbeats cost, counted per thread with -DSPORK_HEARTBEAT_TIMING;
 // nothing without it.
 
-#include "spork_tokens.h"
+#include "tokens.h"
 
 #include <algorithm>
 #include <atomic>

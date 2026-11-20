@@ -1,5 +1,5 @@
-#ifndef PARLAY_INTERNAL_FCONTEXT_H_
-#define PARLAY_INTERNAL_FCONTEXT_H_
+#ifndef PARLAY_INTERNAL_SPORK_FCONTEXT_H_
+#define PARLAY_INTERNAL_SPORK_FCONTEXT_H_
 
 // The context switch, vendored from Boost.Context so that the library stays
 // header-only and does not depend on <boost/context/detail/fcontext.hpp>,
@@ -30,7 +30,7 @@
 //
 // A handle to a stack is produced by the jump that leaves it (RAX = the RSP
 // where these registers were pushed), so a handle exists only for a stack
-// nobody is running on.  The handoff protocol in spork_scheduler.h relies on
+// nobody is running on.  The handoff protocol in handoff.h relies on
 // that property.
 
 #include <cstddef>
@@ -130,4 +130,4 @@ spork_make_fcontext:
     .text
 )asm");
 
-#endif  // PARLAY_INTERNAL_FCONTEXT_H_
+#endif  // PARLAY_INTERNAL_SPORK_FCONTEXT_H_

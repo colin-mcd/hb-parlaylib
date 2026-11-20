@@ -2,7 +2,7 @@
 #define PARLAY_INTERNAL_SPORK_DC_PARFOR_H_
 
 // Spork's parallel loops as divide-and-conquer recursion, used in place of
-// spork_parfor.h's loop slots when built with -DSPORK_DC_LOOPS.  parfor_
+// parfor.h's loop slots when built with -DSPORK_DC_LOOPS.  parfor_
 // below splits [i, j) at its midpoint into a fork: the left half runs here,
 // by recursion, while the right half is the fork's promotable side.  Ranges
 // of at most DC_GRAIN iterations (-DSPORK_DC_GRAIN=G, default 1) are not
@@ -17,8 +17,8 @@
 // with binop, at the join.  So the right half is the fork's tail.  parfor_
 // runs it as the next iteration of its loop, which splits it in turn, rather
 // than as a tail call, which LLVM would not make: the fork's slot is in this
-// frame, and its address is in the spork deque for the duration of the left
-// half, so no later call in the frame may reuse it.
+// frame, and its address is in the prom handler deque for the duration of
+// the left half, so no later call in the frame may reuse it.
 //
 // A promoted right half found unstolen is dropped, as abandon drops it, with
 // its tokens going back to this computation as at the join of a job that took
@@ -26,15 +26,15 @@
 // clock and with its balance.  (A promoted fork in par instead runs its
 // unstolen job on a fresh clock with the job's own tokens, then pools the two
 // sides at the join: fast_clone.)  Under MPL's token scheme
-// (-DSPORK_USE_MPL_HB, spork_tokens.h), its tokens are dropped with it.
+// (-DSPORK_USE_MPL_HB, tokens.h), its tokens are dropped with it.
 //
 // Spork's parallel loops call their body PARLAY_INLINE_CALL, as in
-// spork_parfor.h, which says why.
+// parfor.h, which says why.
 
-#include "spork_scheduler.h"
-#include "capped_copy.h"
-#include "../monoid.h"
-#include "../portability.h"
+#include "scheduler.h"
+#include "../capped_copy.h"
+#include "../../monoid.h"
+#include "../../portability.h"
 
 #include <cstddef>
 #include <exception>
@@ -121,15 +121,15 @@ namespace { // private
     // the rest of the range, [mid, end), with room for its job, which only a
     // promotion builds, as in par.  mid and end are set before each fork
     // links the slot, and read by its promotion.
-    struct Slot : SporkSlot {
+    struct Slot : PromHandler {
       idx mid, end;
       const BodyLambda* body;
       const BinOp* binop;
       union Storage { Storage() {} ~Storage() {} SpwnJob job; } storage;
 
-      Slot(const BodyLambda* f, const BinOp* op) noexcept : SporkSlot(&promotion), body(f), binop(op) {}
+      Slot(const BodyLambda* f, const BinOp* op) noexcept : PromHandler(&promotion), body(f), binop(op) {}
 
-      static void promotion(SporkSlot* s) {
+      static void promotion(PromHandler* s) {
         Slot& slot = *static_cast<Slot*>(s);
         ::new (&slot.storage.job) SpwnJob(slot.mid, slot.end, *slot.body, *slot.binop);
         slot.storage.job.enqueue(split_tokens());

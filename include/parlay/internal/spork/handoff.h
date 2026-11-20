@@ -6,13 +6,13 @@
 // job (run_job, fiber_body), and the joins (WorkStealingJob::join, abandon,
 // join_stolen).
 
-#include "spork_api.h"
-#include "spork_deque.h"
-#include "spork_fiber.h"
-#include "spork_job.h"
-#include "spork_timing.h"
-#include "spork_tokens.h"
-#include "../portability.h"
+#include "../spork_api.h"
+#include "prom_handler_deque.h"
+#include "fiber.h"
+#include "job.h"
+#include "timing.h"
+#include "tokens.h"
+#include "../../portability.h"
 
 #include <atomic>
 #include <cstddef>
@@ -52,13 +52,13 @@ PARLAY_NOINLINE inline void eh_state_install(EhState e) noexcept {
 }
 
 // The state of a stack's computation that this thread's thread-locals hold
-// while it runs here: its spork deque, its balance and mark, whether it has
-// beats disabled, and its exception state.  A suspended computation keeps it
-// in its Fiber (fiber_save, fiber_install), and run_job keeps that of the
-// computation it suspends.
+// while it runs here: its prom handler deque, its balance and mark, whether
+// it has beats disabled, and its exception state.  A suspended computation
+// keeps it in its Fiber (fiber_save, fiber_install), and run_job keeps that
+// of the computation it suspends.
 struct ComputationState {
-  SporkSlot* back;
-  SporkSlot* frontier;
+  PromHandler* newest;
+  PromHandler* last;
   unsigned int tokens;
   std::uint64_t mark;
   bool disable;
@@ -68,20 +68,20 @@ struct ComputationState {
   // field, in place: built whole and then copied, it would keep five values
   // live across eh_state_save's call (callee-saved pushes in join_stolen).
   void save() noexcept {
-    back = spork_deque_back.load();
-    frontier = spork_deque_frontier.load();
+    newest = prom_handler_newest.load();
+    last = prom_handler_last.load();
     tokens = heartbeat_tokens;
     mark = task_mark;
     disable = disable_heartbeats;
     eh = eh_state_save();
   }
 
-  // A computation that starts now on a stack whose sentinel is `front`, with
-  // t tokens: an empty deque, and a mark at now (a right side's mark is when
-  // it starts).
-  void start(SporkSlot* front, unsigned int t) noexcept {
-    back = front;
-    frontier = front;
+  // A computation that starts now on a stack whose sentinel is `sentinel`,
+  // with t tokens: an empty deque, and a mark at now (a right side's mark is
+  // when it starts).
+  void start(PromHandler* sentinel, unsigned int t) noexcept {
+    newest = sentinel;
+    last = sentinel;
     tokens = t;
     mark = NO_CLOCK ? 0 : monotonic_ns();
     disable = false;
@@ -90,8 +90,8 @@ struct ComputationState {
 
   // Make it the computation running on this thread.
   void install() const noexcept {
-    spork_deque_back = back;
-    spork_deque_frontier = frontier;
+    prom_handler_newest = newest;
+    prom_handler_last = last;
     heartbeat_tokens = tokens;
     task_mark = mark;
     disable_heartbeats = disable;
@@ -107,7 +107,7 @@ struct Fiber {
   ComputationState saved;   // this stack's computation while it is not running
   fcontext_t entry;         // enters fiber_trampoline on this stack
   std::size_t stack_size;   // usable stack, from the guard page up to this Fiber
-  SporkSlot deque_front;    // head of this stack's spork deque
+  PromHandler sentinel;     // this stack's prom handler deque's sentinel
 };
 
 [[noreturn]] void fiber_body(Fiber* f);
@@ -155,7 +155,7 @@ PARLAY_NOINLINE inline Fiber* fiber_acquire() {
   }
   void* base = fiber_map_stack();
   auto top = reinterpret_cast<std::uintptr_t>(base) + FIBER_STACK_SIZE - sizeof(Fiber);
-  // default-initialised: SporkSlot's default constructor is explicit
+  // default-initialised: PromHandler's default constructor is explicit
   Fiber* f = new (reinterpret_cast<void*>(top & ~std::uintptr_t{63})) Fiber;
   f->map_base = base;
   f->stack_size = reinterpret_cast<std::uintptr_t>(f) - reinterpret_cast<std::uintptr_t>(base) - FIBER_GUARD_SIZE;
@@ -209,7 +209,7 @@ inline void fiber_trampoline(transfer_t t) {
 
 [[noreturn]] inline void fiber_body(Fiber* f) {
   WorkStealingJob* job = f->job;
-  f->saved.start(&f->deque_front, job->tokens);
+  f->saved.start(&f->sentinel, job->tokens);
   fiber_install(f);
   fiber_switching = false;
   fiber_drain();

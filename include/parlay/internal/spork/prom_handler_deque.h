@@ -1,13 +1,13 @@
-#ifndef PARLAY_INTERNAL_SPORK_DEQUE_H_
-#define PARLAY_INTERNAL_SPORK_DEQUE_H_
+#ifndef PARLAY_INTERNAL_SPORK_PROM_HANDLER_DEQUE_H_
+#define PARLAY_INTERNAL_SPORK_PROM_HANDLER_DEQUE_H_
 
-// Promotable forks: each stack's list of open forks (its spork deque), the
-// frontier up to which they are promoted, and promoting them, in a beat or
+// Promotable forks: each stack's list of open forks (its prom handler
+// deque), the last of them promoted, and promoting them, in a beat or
 // eagerly.
 
-#include "spork_timing.h"
-#include "spork_tokens.h"
-#include "../portability.h"
+#include "timing.h"
+#include "tokens.h"
+#include "../../portability.h"
 
 #include <atomic>
 
@@ -49,28 +49,28 @@ class sigsafe_ptr {
 // fork's left side (spork_open, then close), oldest first.  The fork that
 // owns it derives from it, with whatever its promotion needs (see par and
 // parfor_).
-// A slot has no promoted flag: it is promoted exactly when it is the
-// frontier or older (see spork_deque_frontier).
-struct SporkSlot {
+// A slot has no promoted flag: it is promoted exactly when it is the last
+// promoted slot or older (see prom_handler_last).
+struct PromHandler {
   // The promotion, called with this slot.  A plain function, which knows
   // what the slot belongs to, rather than a closure object: pushing a slot
   // writes one pointer for it.
-  void (*promfn)(SporkSlot*);
-  SporkSlot* prev;   // the next older slot, or the list's sentinel
+  void (*promfn)(PromHandler*);
+  PromHandler* prev;   // the next older slot, or the list's sentinel
   // The next newer slot, if any.  Left unwritten until that slot links in:
-  // promote_front reads it only for slots older than spork_deque_back,
+  // promote_front reads it only for slots older than prom_handler_newest,
   // which is this slot until then.  So, like prev, it needs no atomic
   // access: link writes it while promote_front won't read it, and link's
-  // store to spork_deque_back (a release) publishes it.
-  SporkSlot* next;
+  // store to prom_handler_newest (a release) publishes it.
+  PromHandler* next;
 
-  // A list's sentinel (spork_deque_front, Fiber::deque_front).
-  constexpr explicit SporkSlot() :
+  // A list's sentinel (prom_handler_sentinel, Fiber::sentinel).
+  constexpr explicit PromHandler() :
     promfn(nullptr), prev(nullptr), next(nullptr) {}
 
   // Not yet on the list: its owner finishes building it, and spork_open
   // links it.
-  explicit SporkSlot(void (*fn)(SporkSlot*)) noexcept : promfn(fn) {}
+  explicit PromHandler(void (*fn)(PromHandler*)) noexcept : promfn(fn) {}
 
   void link() noexcept;
   bool close();
@@ -81,47 +81,49 @@ struct SporkSlot {
 
 // Slots live in the frames of the stack that created them, so the list
 // head belongs to that stack too: a fiber owns its own sentinel, and
-// spork_deque_front is the sentinel for a thread's own (pinned) stack.
-// spork_deque_back is the newest slot on the list in use on this thread
+// prom_handler_sentinel is the sentinel for a thread's own (pinned) stack.
+// prom_handler_newest is the newest slot on the list in use on this thread
 // (its sentinel if the list is empty, null until spork_thread_init); it and
-// the frontier are saved and restored across a handoff.
-inline constinit thread_local SporkSlot spork_deque_front{};
-inline constinit thread_local sigsafe_ptr<SporkSlot> spork_deque_back;
+// prom_handler_last are saved and restored across a handoff.
+inline constinit thread_local PromHandler prom_handler_sentinel{};
+inline constinit thread_local sigsafe_ptr<PromHandler> prom_handler_newest;
 // The newest promoted slot on the list in use, or its sentinel if none is.
 // Promotions go oldest first and are never undone, so every slot up to it
 // is promoted and every slot after it is not: a beat starts promoting just
 // after it.  Promotions move it forward and a promoted slot's close moves
 // it back; linking a slot and closing an unpromoted one never touch it.  A
 // closing slot is the newest, so it is promoted exactly when it is the
-// frontier.
-// Saved and restored with the back pointer.
-inline constinit thread_local sigsafe_ptr<SporkSlot> spork_deque_frontier;
+// last promoted slot.
+// Saved and restored with prom_handler_newest.
+inline constinit thread_local sigsafe_ptr<PromHandler> prom_handler_last;
 
 // Make this the newest slot.  Everything its promotion reads must be set
 // first: from here on the heartbeat handler may promote it.
-inline void SporkSlot::link() noexcept {
-  prev = spork_deque_back.load();
+inline void PromHandler::link() noexcept {
+  prev = prom_handler_newest.load();
   prev->next = this;
-  spork_deque_back = this;
+  prom_handler_newest = this;
 }
 
-inline bool SporkSlot::close() {
+inline bool PromHandler::close() {
   // This slot, the newest, read back from the list rather than kept from
   // before the fork's left side ran: comparing against `this` keeps the
   // slot's address in a callee-saved register across the left side.
-  SporkSlot* const self = spork_deque_back.load();
-  spork_deque_back = prev;
-  // Read the frontier only once unlinked: read before, it could miss a beat
-  // that promotes this slot in between, whose job would never be synced.
+  PromHandler* const self = prom_handler_newest.load();
+  prom_handler_newest = prev;
+  // Read the last promoted slot only once unlinked: read before, it could
+  // miss a beat that promotes this slot in between, whose job would never be
+  // synced.
   std::atomic_signal_fence(std::memory_order_seq_cst);
-  if (spork_deque_frontier.load() != self) [[likely]] return false;
-  // Promoted: the frontier moves back to the slot before it.  A beat that
-  // comes in between finds the frontier already unlinked (promote_front).
-  spork_deque_frontier = prev;
+  if (prom_handler_last.load() != self) [[likely]] return false;
+  // Promoted: the last promoted slot is now the one before it.  A beat that
+  // comes in between finds the last promoted slot already unlinked
+  // (promote_front).
+  prom_handler_last = prev;
   return true;
 }
 
-inline void SporkSlot::promote() {
+inline void PromHandler::promote() {
 #ifdef SPORK_HEARTBEAT_TIMING
   if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->promotions, 1);
 #endif
@@ -129,36 +131,38 @@ inline void SporkSlot::promote() {
   promfn(this);
 }
 
-inline void SporkSlot::promote_front() {
-  SporkSlot* slot = spork_deque_frontier.load();
-  SporkSlot* const back = spork_deque_back.load();
-  // The frontier's close has unlinked it but not yet moved the frontier
-  // back: it was the newest slot, so every slot left is promoted.
-  if (slot->prev == back) return;
-  while (heartbeat_tokens && slot != back) {
+inline void PromHandler::promote_front() {
+  PromHandler* slot = prom_handler_last.load();
+  PromHandler* const newest = prom_handler_newest.load();
+  // The last promoted slot's close has unlinked it but not yet moved
+  // prom_handler_last back: it was the newest slot, so every slot left is
+  // promoted.
+  if (slot->prev == newest) return;
+  while (heartbeat_tokens && slot != newest) {
     slot = slot->next;
     slot->promote();
-    spork_deque_frontier = slot;
+    prom_handler_last = slot;
   }
 }
 
-// A thread's own stack gets an empty spork deque of its own.
+// A thread's own stack gets an empty prom handler deque of its own.
 inline void spork_thread_init() noexcept {
-  if (spork_deque_back.load() == nullptr) {
-    spork_deque_back = &spork_deque_front;
-    spork_deque_frontier = &spork_deque_front;
+  if (prom_handler_newest.load() == nullptr) {
+    prom_handler_newest = &prom_handler_sentinel;
+    prom_handler_last = &prom_handler_sentinel;
   }
 }
 
-PARLAY_NOINLINE inline void SporkSlot::eager_promote() {
+PARLAY_NOINLINE inline void PromHandler::eager_promote() {
 #ifdef SPORK_HEARTBEAT_TIMING
   const std::uint64_t timing_start = __rdtsc();
 #endif
   const HeartbeatsDisabled beats_off;
-  // A beat since link may have promoted it already, making it the frontier.
-  if (heartbeat_tokens && spork_deque_frontier.load() != this) {
+  // A beat since link may have promoted it already, making it the last
+  // promoted slot.
+  if (heartbeat_tokens && prom_handler_last.load() != this) {
     promote();
-    spork_deque_frontier = this;   // the newest slot: with tokens to spend, every older one is promoted
+    prom_handler_last = this;   // the newest slot: with tokens to spend, every older one is promoted
   }
 #ifdef SPORK_HEARTBEAT_TIMING
   if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->eager_ticks, __rdtsc() - timing_start);
@@ -171,7 +175,7 @@ PARLAY_NOINLINE inline void SporkSlot::eager_promote() {
 // promoted (see par and parfor_, which also handle a left side that throws).
 // Under HBC's scheme (SPORK_USE_HBC_HB) the balance is 0 outside a beat, so
 // no fork is promoted eagerly, and none checks.
-PARLAY_INLINE void spork_open(SporkSlot& slot) {
+PARLAY_INLINE void spork_open(PromHandler& slot) {
   slot.link();
   if constexpr (!HBC_HB) {
     if (heartbeat_tokens) [[unlikely]]
@@ -181,4 +185,4 @@ PARLAY_INLINE void spork_open(SporkSlot& slot) {
 
 }  // namespace spork
 
-#endif  // PARLAY_INTERNAL_SPORK_DEQUE_H_
+#endif  // PARLAY_INTERNAL_SPORK_PROM_HANDLER_DEQUE_H_

@@ -143,9 +143,9 @@ static void par_do3_if(bool do_parallel, Lf&& left, Mf&& mid, Rf&& right) {
 #define PARLAY_USING_PARLAY_SCHEDULER
 
 #include "scheduler.h"
-#include "internal/spork_scheduler.h"
-#include "internal/spork_par.h"
-#include "internal/spork_parfor.h"
+#include "internal/spork/scheduler.h"
+#include "internal/spork/par.h"
+#include "internal/spork/parfor.h"
 
 
 namespace parlay {

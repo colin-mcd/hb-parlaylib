@@ -6,7 +6,7 @@
 // into tokens at beats and joins (HeartbeatCarry in spork-proofs2), and
 // disabling beats around code that rewrites them.
 
-#include "../portability.h"
+#include "../../portability.h"
 
 #include <algorithm>
 #include <atomic>
@@ -102,9 +102,9 @@ static_assert(HEARTBEAT_INTERVAL_NS < 1000000000u, "the timer is set through tv_
 // SPORK_USE_MPL_HB is MPL's scheme, SPORK_NO_CLOCK's but for one rule: a
 // job found unstolen at its join is run by its parent as a plain call, on
 // the parent's own balance, and the tokens it was given are dropped
-// (fast_clone, abandon, spork_dc_parfor.h).  Only a stolen job's leftover
+// (fast_clone, abandon, dc_parfor.h).  Only a stolen job's leftover
 // tokens come back, added to the parent's.  It implies SPORK_DC_LOOPS
-// (spork_parfor.h).
+// (parfor.h).
 // SPORK_USE_HBC_HB is HBC's scheme: no tokens at all.  Each beat promotes
 // the oldest fork not yet promoted, if there is one, and is lost otherwise
 // (run_heartbeat); no fork is promoted eagerly, a job starts with nothing,
@@ -130,7 +130,7 @@ inline constexpr bool NO_CLOCK = true;
 inline constexpr bool NO_CLOCK = false;
 #endif
 // Whether a job found unstolen at its join hands tokens back to its parent
-// (fast_clone, abandon, spork_dc_parfor.h): not under MPL's scheme, which
+// (fast_clone, abandon, dc_parfor.h): not under MPL's scheme, which
 // drops them, nor under HBC's, which has none.
 inline constexpr bool UNSTOLEN_JOIN_TOKENS = !MPL_HB && !HBC_HB;
 // The running computation's mark: saved and restored with its tokens.  Its
@@ -185,13 +185,14 @@ class HeartbeatsDisabled {
 // ---- converting credit into tokens ------------------------------------------
 // Beats and joins convert credit the same way, by settle, the scheme
 // spork-proofs2's HeartbeatCarry.lean proves the work and span bounds for.
-// With B = TOKENS_PER_HEARTBEAT and N the interval, a clock c and a balance
-// t are together worth credit B * c + N * t.  settle(K) gives the running
-// computation s = min(TOKEN_LIMIT, floor(K / N)) tokens.  Below the cap the
-// credit not converted, under one token's worth, stays on its clock in
-// full, floor((K - N * s) / B) of it, even if that reaches back past this
-// thread's last beat (a negative base); at the cap it is dropped and the
-// clock restarts at now.  No credit is ever created.
+// With B = TOKENS_PER_HEARTBEAT and N = HEARTBEAT_INTERVAL_NS the interval,
+// a clock c and a balance t are together worth credit B * c + N * t.
+// settle(K) gives the running computation s = min(TOKEN_LIMIT, floor(K / N)) tokens.
+// Below the cap the credit not converted, under one token's worth,
+// stays on its clock in full, floor((K - N * s) / B) of it, even if that
+// reaches back past this thread's last beat (a negative base);
+// at the cap it is dropped and the clock restarts at now.
+// No credit is ever created.
 //  - A beat settles the running computation's own credit,
 //    K = B * clock + N * t, so below the cap a beat that converts nothing
 //    leaves the mark where it was.  (HeartbeatCarry clamps the clock at N
@@ -201,15 +202,10 @@ class HeartbeatsDisabled {
 // The hardware timer is never touched.  Called from the beat handler, or
 // with beats disabled, so that no beat can land between reading the credit
 // and replacing it.
-PARLAY_INLINE void settle(std::uint64_t K, std::uint64_t N, std::uint64_t now) noexcept {
-  const std::uint64_t s = K / N;
-  if (s < TOKEN_LIMIT) {
-    heartbeat_tokens = static_cast<unsigned int>(s);
-    task_mark = now - (K - N * s) / TOKENS_PER_HEARTBEAT;
-  } else {
-    heartbeat_tokens = TOKEN_LIMIT;
-    task_mark = now;
-  }
+PARLAY_INLINE void settle(std::uint64_t K, std::uint64_t now) noexcept {
+  K = std::min(K, HEARTBEAT_INTERVAL_NS * TOKEN_LIMIT);
+  heartbeat_tokens = static_cast<unsigned int>(K / HEARTBEAT_INTERVAL_NS);
+  task_mark = now - (K % HEARTBEAT_INTERVAL_NS) / TOKENS_PER_HEARTBEAT;
 }
 
 // Every join, stolen or not: c1, t1 are the clock and balance of the side
@@ -226,8 +222,9 @@ inline void join_tokens_disabled(std::uint64_t c1, unsigned int t1,
     heartbeat_tokens = std::min(t1 + t2, TOKEN_LIMIT);
     return;
   }
-  const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
-  settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (c1 + c2) + N * (std::uint64_t{t1} + t2), N, now);
+  const std::uint64_t K_clock = std::uint64_t{TOKENS_PER_HEARTBEAT} * (c1 + c2);
+  const std::uint64_t K_tokens = HEARTBEAT_INTERVAL_NS * (std::uint64_t{t1} + t2);
+  settle(K_clock + K_tokens, now);
 }
 
 // A join whose two sides' clocks and balances were recorded beforehand,

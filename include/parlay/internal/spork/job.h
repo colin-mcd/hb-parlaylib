@@ -4,11 +4,11 @@
 // The job a promotion spawns (WorkStealingJob), and how an exception thrown
 // on either side of a fork reaches its join.
 
-#include "spork_api.h"
-#include "spork_fiber.h"
-#include "spork_tokens.h"
-#include "work_stealing_deque.h"
-#include "../portability.h"
+#include "../spork_api.h"
+#include "fiber.h"
+#include "tokens.h"
+#include "../work_stealing_deque.h"
+#include "../../portability.h"
 
 #include <atomic>
 #include <cstdint>
@@ -131,7 +131,7 @@ struct WorkStealingJob {
   // join waits for the job, running it here if nobody stole it, and returns
   // whether it threw, keeping the exception in the job; sync throws it on.
   // abandon is the join for a parent whose own side threw first.  Defined
-  // in spork_handoff.h, with the fibers, as is join_stolen, the part of join
+  // in handoff.h, with the fibers, as is join_stolen, the part of join
   // and abandon for a job some thief took.
   bool join();
   void sync() {

@@ -4,13 +4,13 @@
 // The heartbeat: each thread's timer, and the signal handler that converts
 // the running computation's credit into tokens and promotes with them.
 
-#include "spork_api.h"
-#include "spork_deque.h"
-#include "spork_fiber.h"
-#include "spork_job.h"
-#include "spork_timing.h"
-#include "spork_tokens.h"
-#include "../portability.h"
+#include "../spork_api.h"
+#include "prom_handler_deque.h"
+#include "fiber.h"
+#include "job.h"
+#include "timing.h"
+#include "tokens.h"
+#include "../../portability.h"
 
 #include <algorithm>
 #include <atomic>
@@ -130,13 +130,14 @@ inline void run_heartbeat(std::uint64_t now) noexcept {
   } else if constexpr (NO_CLOCK) {
     heartbeat_tokens = std::min(heartbeat_tokens + TOKENS_PER_HEARTBEAT, TOKEN_LIMIT);
   } else {
-    const std::uint64_t N = HEARTBEAT_INTERVAL_NS;
-    settle(std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark) + N * heartbeat_tokens, N, now);
+    const std::uint64_t K_clock = std::uint64_t{TOKENS_PER_HEARTBEAT} * (now - task_mark);
+    const std::uint64_t K_tokens = HEARTBEAT_INTERVAL_NS * heartbeat_tokens;
+    settle(K_clock + K_tokens, now);
   }
 #ifdef SPORK_HEARTBEAT_TIMING
   const std::uint64_t promotions_before = heartbeat_timing_mine ? heartbeat_timing_mine->promotions : 0;
 #endif
-  SporkSlot::promote_front();
+  PromHandler::promote_front();
 #ifdef SPORK_HEARTBEAT_TIMING
   if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->handler_promotions, t->promotions - promotions_before);
 #endif

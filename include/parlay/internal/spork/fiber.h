@@ -10,7 +10,7 @@
 // the stack the continuation lives on.  This header holds the machine-level
 // half of that: context switching, lazily committed stacks, and which fiber
 // each thread is running.  The protocol that uses them is in
-// spork_handoff.h.
+// handoff.h.
 //
 // Switching is Boost.Context's fcontext, vendored in fcontext.h.  A jump
 // pushes the callee-saved registers onto the stack being left and hands back
@@ -21,7 +21,7 @@
 // and x87 control words, which are callee-saved under the System V ABI.
 
 #include "fcontext.h"
-#include "spork_api.h"
+#include "../spork_api.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,20 +1,20 @@
 #ifndef PARLAY_INTERNAL_SPORK_PARFOR_H_
 #define PARLAY_INTERNAL_SPORK_PARFOR_H_
 
-// MPL's token scheme (-DSPORK_USE_MPL_HB, spork_tokens.h) implies
+// MPL's token scheme (-DSPORK_USE_MPL_HB, tokens.h) implies
 // divide-and-conquer loops.
 #if defined(SPORK_USE_MPL_HB) && !defined(SPORK_DC_LOOPS)
 #define SPORK_DC_LOOPS
 #endif
 
 #ifdef SPORK_DC_LOOPS
-#include "spork_dc_parfor.h"
+#include "dc_parfor.h"
 #else
 
-#include "spork_scheduler.h"
-#include "capped_copy.h"
-#include "../monoid.h"
-#include "../portability.h"
+#include "scheduler.h"
+#include "../capped_copy.h"
+#include "../../monoid.h"
+#include "../../portability.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,9 +40,10 @@ extern "C" unsigned int __spork_get_unroll_factor(const void* site) noexcept;
 #endif
 
 // Spork's parallel loops call their body PARLAY_INLINE_CALL (parfor_ below,
-// and the wrappers between it and parallel_for's callable in scheduler.h), so
-// that a function that recurses through its own loop body (nqueens) is split
-// at the function, never at the body, whatever the inliner's size estimates.
+// and the wrappers between it and parallel_for's callable in
+// parlay/scheduler.h), so that a function that recurses through its own loop
+// body (nqueens) is split at the function, never at the body, whatever the
+// inliner's size estimates.
 // Left to the inliner, nqueens flipped to calling its body out of line for
 // every iteration (+70%) when an unrelated change made the function smaller.
 // Measured 2026-10-09 against leaving it to the inliner: PBBS at 80 cores
@@ -152,7 +153,7 @@ namespace { // private
     // rather than through a closure of references built on every call (as in
     // par).  The progress word and the bound stay separate locals, pointed
     // to from here: the unroll plugin requires each to be its own stack slot.
-    struct LoopSlot : SporkSlot {
+    struct LoopSlot : PromHandler {
       volatile sig_atomic_t* progress;
       volatile idx* bound;
       idx end;
@@ -162,9 +163,9 @@ namespace { // private
 
       LoopSlot(volatile sig_atomic_t* p, volatile idx* b, idx e,
                const BodyLambda* f, const BinOp* op) noexcept
-        : SporkSlot(&promotion), progress(p), bound(b), end(e), body(f), binop(op) {}
+        : PromHandler(&promotion), progress(p), bound(b), end(e), body(f), binop(op) {}
 
-      static void promotion(SporkSlot* s) {
+      static void promotion(PromHandler* s) {
         LoopSlot& self = *static_cast<LoopSlot*>(s);
         SpwnJob& l = self.ls.job;
         SpwnJob& r = self.rs.job;
