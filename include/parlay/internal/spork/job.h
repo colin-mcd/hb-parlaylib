@@ -29,9 +29,10 @@
 
 namespace parlay {
 template <typename Job>
-class scheduler;
+struct scheduler;
 namespace internal {
-unsigned int init_num_workers();
+// This thread's scheduler, made if it has none yet (parallel.h).
+inline scheduler<spork::WorkStealingJob>& get_current_scheduler();
 }
 }
 
@@ -55,15 +56,19 @@ PARLAY_NOINLINE PARLAY_COLD inline void throw_kept(std::exception_ptr& kept) {
   if (e) std::rethrow_exception(e);
 }
 
+// Raw storage for an exception a fork keeps while it joins its job: built
+// by the fork's handler only if its own side throws, and destroyed by
+// throw_kept, which throws it on.
+union KeptException {
+  KeptException() {}
+  ~KeptException() {}
+  std::exception_ptr e;
+};
+
 struct WorkStealingJob {
   using scheduler_t = parlay::scheduler<WorkStealingJob>;
   static scheduler_t& get_current_scheduler() {
-    scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
-    if (current_scheduler == nullptr) {
-      static thread_local scheduler_t local_scheduler(parlay::internal::init_num_workers());
-      return local_scheduler;
-    }
-    return *current_scheduler;
+    return parlay::internal::get_current_scheduler();
   }
   static unsigned int worker_id() {
     return get_current_scheduler().worker_id();
@@ -111,7 +116,7 @@ struct WorkStealingJob {
       // parent's clock and balance and replacing them with the job's.  The
       // parent's clock runs up to now, and the job's starts now.
       const HeartbeatsDisabled beats_off;
-      const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
+      const std::uint64_t now = clock_now();
       e1 = now - task_mark;
       t1 = heartbeat_tokens;
       if constexpr (!NO_CLOCK) task_mark = now;
@@ -120,7 +125,7 @@ struct WorkStealingJob {
     // If the job throws, its exception is kept in it, as a thief would keep
     // it (fiber_body), and the join happens all the same.
     SPORK_TRY {
-      const_cast<WorkStealingJob*>(this)->run();
+      run();
     } SPORK_CATCH_ALL {
       keep_exception();
     }

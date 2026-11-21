@@ -21,8 +21,4 @@
 #include "handoff.h"
 #include "heartbeat.h"
 
-namespace parlay {
-using WorkStealingJob = spork::WorkStealingJob;
-}
-
 #endif  // PARLAY_INTERNAL_SPORK_SCHEDULER_H_

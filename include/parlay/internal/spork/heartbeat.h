@@ -21,6 +21,10 @@
 
 #include <unistd.h>
 
+namespace parlay::internal {
+unsigned int init_num_workers();   // parallel.h
+}
+
 namespace spork {
 
 // ---- heartbeat state --------------------------------------------------------
@@ -91,7 +95,6 @@ inline constinit thread_local timer_t heartbeat_timer;
 inline constinit thread_local volatile bool heartbeat_timer_live = false;
 // This thread's beats fall at this offset into each interval (start_heartbeats).
 inline constinit thread_local std::uint64_t heartbeat_phase = 0;
-inline constinit itimerspec heartbeat_its_zero = {};
 
 // Arm this thread's timer for the first point of its grid, phase + k * N
 // for whole k, at least N / 2 from now.  Normally that is the next one; a
@@ -137,7 +140,7 @@ inline void run_heartbeat(std::uint64_t now) noexcept {
 #ifdef SPORK_HEARTBEAT_TIMING
   const std::uint64_t promotions_before = heartbeat_timing_mine ? heartbeat_timing_mine->promotions : 0;
 #endif
-  PromHandler::promote_front();
+  PromHandler::promote_after_last();
 #ifdef SPORK_HEARTBEAT_TIMING
   if (HeartbeatTiming* t = heartbeat_timing_mine) timing_add(t->handler_promotions, t->promotions - promotions_before);
 #endif
@@ -152,21 +155,22 @@ inline void run_heartbeat(std::uint64_t now) noexcept {
 PARLAY_NOINLINE inline void run_pending_heartbeat() noexcept {
   heartbeat_pending = false;
   disable_heartbeats = true;
-  if (!heartbeats_idle && !fiber_switching) run_heartbeat(NO_CLOCK ? 0 : monotonic_ns());
+  std::atomic_signal_fence(std::memory_order_seq_cst);   // fenced as in HeartbeatsDisabled
+  if (!heartbeats_idle && !fiber_switching) run_heartbeat(clock_now());
+  std::atomic_signal_fence(std::memory_order_release);
   disable_heartbeats = false;
   std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-inline void heartbeat_handler(int sig) {
+inline void heartbeat_handler(int) {
 #ifdef SPORK_HEARTBEAT_TIMING
   const std::uint64_t timing_start = __rdtsc();
 #endif
   if (in_heartbeat_handler) return;   // this beat interrupted the handler (SA_NODEFER)
-  if (heartbeats_done.load(std::memory_order_relaxed)) return;
   in_heartbeat_handler = true;
   std::atomic_signal_fence(std::memory_order_seq_cst);
   int saved_errno = errno;
-  const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
+  const std::uint64_t now = clock_now();
   // fiber_switching covers the window in which the thread-local view of the
   // computation (deque pointers, tokens) does not match the stack it is
   // about to run on.  A beat lost there is harmless; promoting from the
@@ -256,15 +260,14 @@ inline void start_heartbeats() noexcept {
   heartbeats_idle = false;
 }
 
-// Disarm for good: called when a worker leaves the scheduler, and by the main
-// thread when the scheduler shuts down.
+// Disarm for good: called when a worker leaves its scheduler, and by a thread
+// whose last scheduler shuts down (~scheduler).
 inline void stop_heartbeats() noexcept {
   heartbeats_idle = true;
   if (heartbeat_timer_live) {
     heartbeat_timer_live = false;   // first: a beat landing below must not re-arm the timer
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
-    timer_delete(heartbeat_timer);
+    timer_delete(heartbeat_timer);   // disarms it too
   }
 }
 

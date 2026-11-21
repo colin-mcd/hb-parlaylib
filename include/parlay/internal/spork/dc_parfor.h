@@ -100,7 +100,7 @@ namespace { // private
     // by whoever runs it, in raw storage: building the job (in the signal
     // handler, by the promotion) then constructs no A, so the job is plain
     // stores to build and trivial to destroy, whatever the accumulator.
-    struct SpwnJob : WorkStealingJob {
+    struct SpwnJob final : WorkStealingJob {
       idx i, j;
       const BodyLambda& body;
       const BinOp& binop;
@@ -151,8 +151,8 @@ namespace { // private
       // If the left half throws, its exception is the one that goes on, as it
       // would serially; handled as in par, whose comments say why.
       bool left_threw = false;
-      union Kept { Kept() {} ~Kept() {} std::exception_ptr e; } kept;
-      spork_open(slot);
+      KeptException kept;
+      slot.open();
       SPORK_TRY {
         if (std::cmp_less_equal(mid - i, DC_GRAIN)) run_leaf(i, mid);
         else a = parfor_<idx, BodyLambda, BinOp>(i, mid, std::move(a), body, binop);

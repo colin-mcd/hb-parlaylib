@@ -46,9 +46,8 @@ class sigsafe_ptr {
 };
 
 // A promotable fork: pushed onto its stack's list for the duration of the
-// fork's left side (spork_open, then close), oldest first.  The fork that
-// owns it derives from it, with whatever its promotion needs (see par and
-// parfor_).
+// fork's left side (open, then close), oldest first.  The fork that owns it
+// derives from it, with whatever its promotion needs (see par and parfor_).
 // A slot has no promoted flag: it is promoted exactly when it is the last
 // promoted slot or older (see prom_handler_last).
 struct PromHandler {
@@ -58,24 +57,27 @@ struct PromHandler {
   void (*promfn)(PromHandler*);
   PromHandler* prev;   // the next older slot, or the list's sentinel
   // The next newer slot, if any.  Left unwritten until that slot links in:
-  // promote_front reads it only for slots older than prom_handler_newest,
-  // which is this slot until then.  So, like prev, it needs no atomic
-  // access: link writes it while promote_front won't read it, and link's
-  // store to prom_handler_newest (a release) publishes it.
+  // promote_after_last reads it only for slots older than
+  // prom_handler_newest, which is this slot until then.  So, like prev, it
+  // needs no atomic access: link writes it while promote_after_last won't
+  // read it, and link's store to prom_handler_newest (a release) publishes
+  // it.
   PromHandler* next;
 
   // A list's sentinel (prom_handler_sentinel, Fiber::sentinel).
   constexpr explicit PromHandler() :
     promfn(nullptr), prev(nullptr), next(nullptr) {}
 
-  // Not yet on the list: its owner finishes building it, and spork_open
-  // links it.
+  // Not yet on the list: its owner finishes building it, and open links it.
   explicit PromHandler(void (*fn)(PromHandler*)) noexcept : promfn(fn) {}
 
-  void link() noexcept;
+  void open();
   bool close();
+  static void promote_after_last();
+
+ private:
+  void link() noexcept;
   void promote();
-  static void promote_front();
   void eager_promote();
 };
 
@@ -118,7 +120,7 @@ inline bool PromHandler::close() {
   if (prom_handler_last.load() != self) [[likely]] return false;
   // Promoted: the last promoted slot is now the one before it.  A beat that
   // comes in between finds the last promoted slot already unlinked
-  // (promote_front).
+  // (promote_after_last).
   prom_handler_last = prev;
   return true;
 }
@@ -131,7 +133,7 @@ inline void PromHandler::promote() {
   promfn(this);
 }
 
-inline void PromHandler::promote_front() {
+inline void PromHandler::promote_after_last() {
   PromHandler* slot = prom_handler_last.load();
   PromHandler* const newest = prom_handler_newest.load();
   // The last promoted slot's close has unlinked it but not yet moved
@@ -169,17 +171,17 @@ PARLAY_NOINLINE inline void PromHandler::eager_promote() {
 #endif
 }
 
-// Open a promotable fork whose slot is `slot` (built, not yet linked): link
-// it, and promote it at once if this computation holds tokens.  The fork
-// then runs its left side and closes the slot, which says whether it was
+// Open a promotable fork with this slot (built, not yet linked): link it,
+// and promote it at once if this computation holds tokens.  The fork then
+// runs its left side and closes the slot, which says whether it was
 // promoted (see par and parfor_, which also handle a left side that throws).
 // Under HBC's scheme (SPORK_USE_HBC_HB) the balance is 0 outside a beat, so
 // no fork is promoted eagerly, and none checks.
-PARLAY_INLINE void spork_open(PromHandler& slot) {
-  slot.link();
+PARLAY_INLINE void PromHandler::open() {
+  link();
   if constexpr (!HBC_HB) {
     if (heartbeat_tokens) [[unlikely]]
-      slot.eager_promote();
+      eager_promote();
   }
 }
 

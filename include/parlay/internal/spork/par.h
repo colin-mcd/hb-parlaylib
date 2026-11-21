@@ -23,7 +23,7 @@ PARLAY_INLINE void par(const LambdaL& lamL, const LambdaR& lamR) {
   static_assert(std::is_invocable_v<const LambdaL&>);
   static_assert(std::is_invocable_v<const LambdaR&>);
   
-  struct SpwnJob : WorkStealingJob {
+  struct SpwnJob final : WorkStealingJob {
     const LambdaR& lamR;
     void run() override { lamR(); }
     SpwnJob(const LambdaR& lamR) :
@@ -55,8 +55,8 @@ PARLAY_INLINE void par(const LambdaL& lamL, const LambdaR& lamR) {
   // landing pad, run only by the unwinder.  The handler only keeps the
   // exception, and calls nothing that can throw.
   bool left_threw = false;
-  union Kept { Kept() {} ~Kept() {} std::exception_ptr e; } kept;
-  spork_open(slot);
+  KeptException kept;
+  slot.open();
   SPORK_TRY {
     lamL();
   } SPORK_CATCH_ALL {

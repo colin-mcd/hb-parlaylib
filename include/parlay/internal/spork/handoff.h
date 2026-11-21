@@ -83,7 +83,7 @@ struct ComputationState {
     newest = sentinel;
     last = sentinel;
     tokens = t;
-    mark = NO_CLOCK ? 0 : monotonic_ns();
+    mark = clock_now();
     disable = false;
     eh = EhState{};
   }

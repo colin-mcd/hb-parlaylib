@@ -140,9 +140,14 @@ struct scheduler {
   }
 
   ~scheduler() {
-    spork::heartbeats_done.store(true, std::memory_order_relaxed);
-    spork::stop_heartbeats();
-    spork::pause_heartbeats();
+    // Only a thread's last scheduler stops its heartbeats.  An outer one
+    // (execute_with_scheduler, or a scheduler whose worker made this one)
+    // still runs its computation on this thread, and start_heartbeats makes
+    // a thread's timer only once.
+    if (parent_worker_info.my_scheduler == nullptr) {
+      spork::stop_heartbeats();
+      spork::pause_heartbeats();
+    }
     shutdown();
     worker_info = std::move(parent_worker_info);
   }

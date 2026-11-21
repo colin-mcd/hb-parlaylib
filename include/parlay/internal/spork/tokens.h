@@ -133,6 +133,12 @@ inline constexpr bool NO_CLOCK = false;
 // (fast_clone, abandon, dc_parfor.h): not under MPL's scheme, which
 // drops them, nor under HBC's, which has none.
 inline constexpr bool UNSTOLEN_JOIN_TOKENS = !MPL_HB && !HBC_HB;
+// The time for a clock or a mark: now, or 0 when there are no clocks
+// (SPORK_NO_CLOCK).
+PARLAY_INLINE std::uint64_t clock_now() noexcept {
+  if constexpr (NO_CLOCK) return 0;
+  return monotonic_ns();
+}
 // The running computation's mark: saved and restored with its tokens.  Its
 // credit clock, now - mark, is the proofs' phase - base: the time it has
 // run and not yet converted into tokens.
@@ -166,13 +172,20 @@ inline void run_pending_heartbeat() noexcept;
 // between would be lost or counted twice.  A beat that lands meanwhile is
 // left pending (heartbeat_handler), and the outermost guard runs it on the
 // way out, once beats are back on: disabling beats delays a beat by at most
-// the guarded code, and loses none.
+// the guarded code, and loses none.  Signal fences (no instructions) keep
+// the guarded code between disabling and re-enabling: the compiler could
+// otherwise move a relaxed access, such as one to prom_handler_last, past
+// the volatile flag, out to where a beat is acted on.
 class HeartbeatsDisabled {
   const bool outermost = !disable_heartbeats;
  public:
-  HeartbeatsDisabled() noexcept { disable_heartbeats = true; }
+  HeartbeatsDisabled() noexcept {
+    disable_heartbeats = true;
+    std::atomic_signal_fence(std::memory_order_seq_cst);   // the guarded code comes after
+  }
   ~HeartbeatsDisabled() {
     if (!outermost) return;
+    std::atomic_signal_fence(std::memory_order_release);   // the guarded code comes before
     disable_heartbeats = false;
     // Check only once enabled: a beat from here on is acted on directly.
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -240,7 +253,7 @@ PARLAY_NOINLINE inline void join_tokens(std::uint64_t c1, unsigned int t1,
                                           std::uint64_t c2, unsigned int t2,
                                           std::uint64_t now = 0) noexcept {
   const HeartbeatsDisabled beats_off;
-  if (!NO_CLOCK && now == 0) now = monotonic_ns();
+  if (now == 0) now = clock_now();
   join_tokens_disabled(c1, t1, c2, t2, now);
 }
 
@@ -251,7 +264,7 @@ PARLAY_NOINLINE inline void join_tokens(std::uint64_t c1, unsigned int t1,
 // Its clock runs up to now.
 PARLAY_NOINLINE inline void join_tokens_running(std::uint64_t c_other, unsigned int t_other) noexcept {
   const HeartbeatsDisabled beats_off;
-  const std::uint64_t now = NO_CLOCK ? 0 : monotonic_ns();
+  const std::uint64_t now = clock_now();
   const std::uint64_t c = now - task_mark;
   join_tokens_disabled(c_other, t_other, c, heartbeat_tokens, now);
 }

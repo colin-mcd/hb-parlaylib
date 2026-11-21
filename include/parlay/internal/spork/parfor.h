@@ -120,7 +120,7 @@ namespace { // private
       return a;
     }
 
-    struct SpwnJob : WorkStealingJob {
+    struct SpwnJob final : WorkStealingJob {
       volatile idx i, j;
       const BodyLambda& body;
       const BinOp& binop;
@@ -210,20 +210,19 @@ namespace { // private
     SpwnJob& l = slot.ls.job;
     SpwnJob& r = slot.rs.job;
 
-    bool promoted = false;
-    // Whichever jobs were built are destroyed on the way out, by exception
-    // too; a no-op for trivial ones.
+    // Jobs built up front are destroyed on the way out, by exception too.
+    // Lazy jobs, whose accumulator is trivial, are trivially destructible.
+    static_assert(!lazy_jobs || std::is_trivially_destructible_v<SpwnJob>);
     struct DestroyJobs {
       SpwnJob& l;
       SpwnJob& r;
-      const bool& promoted;
       ~DestroyJobs() {
-        if (!lazy_jobs || promoted) {
+        if constexpr (!lazy_jobs) {
           std::destroy_at(&l);
           std::destroy_at(&r);
         }
       }
-    } destroy_jobs{l, r, promoted};
+    } destroy_jobs{l, r};
 
     // Serially, an exception from this loop's own iterations comes before
     // l's, and l's before r's: the first one is thrown on once the jobs are
@@ -231,7 +230,7 @@ namespace { // private
     // Handled as in par: the handlers only keep the exception, and throw_kept
     // throws it on outside them.
     bool threw = false;
-    union Kept { Kept() {} ~Kept() {} std::exception_ptr e; } kept;
+    KeptException kept;
     const auto loop = [&, body = body] () PARLAY_ALWAYS_INLINE {
         #ifdef VOLATILE_UNROLL
         __spork_unroll_loop(&unroll_site);
@@ -242,7 +241,7 @@ namespace { // private
           sig_safe_i = static_cast<sig_atomic_t>(i);
         }
       };
-    spork_open(slot);
+    slot.open();
     SPORK_TRY {
       loop();
     } SPORK_CATCH_ALL {
@@ -250,15 +249,14 @@ namespace { // private
       threw = true;
     }
     if (threw) [[unlikely]] {
-      promoted = slot.close();
-      if (promoted) {
+      if (slot.close()) {   // promoted
         // Last enqueued, first joined: l, then r.
         if (l.i < l.j) l.abandon();
         if (r.i < r.j) r.abandon();
       }
       throw_kept(kept.e);   // never returns (but see throw_kept)
       return A{};
-    } else if ((promoted = slot.close())) [[unlikely]] {
+    } else if (slot.close()) [[unlikely]] {   // promoted
       // No handler here: l.join() reports an exception rather than throwing
       // it, and both jobs are joined before either result is combined, so a
       // binop that throws leaves no job behind.  A handler on this path made
